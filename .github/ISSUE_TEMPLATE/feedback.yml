@@ -1,0 +1,27 @@
+name: Feedback
+description: Share general feedback about HitMarkers.
+title: "[Feedback]: "
+labels: ["feedback"]
+body:
+  - type: textarea
+    id: feedback
+    attributes:
+      label: Feedback
+      description: Tell us what worked well, what felt wrong, or what should change.
+    validations:
+      required: true
+  - type: input
+    id: mod-version
+    attributes:
+      label: Mod version
+      placeholder: "1.0.0"
+  - type: input
+    id: game-version
+    attributes:
+      label: S.T.A.L.K.E.R. 2 version
+      placeholder: "Game version or build number"
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Add platform, other mods, screenshots, or anything else that helps explain your feedback.

@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a problem with HitMarkers.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: mod-version
+    attributes:
+      label: Mod version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: game-version
+    attributes:
+      label: S.T.A.L.K.E.R. 2 version
+      placeholder: "Game version or build number"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Steam
+        - GOG
+        - Xbox app / Microsoft Store
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Install the mod.
+        2. Launch the game.
+        3. Shoot an enemy.
+    validations:
+      required: true
+  - type: textarea
+    id: other-mods
+    attributes:
+      label: Other installed mods
+      description: List other mods or write "None".
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots, video, or logs
+      description: Attach anything that helps reproduce or diagnose the issue.

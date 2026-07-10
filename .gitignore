@@ -1,0 +1,29 @@
+# Unreal build output
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Packaged mod artifacts
+dist/
+*.pak
+*.ucas
+*.utoc
+*.sig
+
+# Local cooked input directory
+CookedContent/*
+!CookedContent/.gitkeep
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+
+# Editor and OS files
+.idea/
+.vscode/
+.vs/
+Thumbs.db
+Desktop.ini
