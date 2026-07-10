@@ -14,7 +14,9 @@ param(
 
     [string]$WorkDir = (Join-Path $PSScriptRoot '..\.build\HitMarkers'),
 
-    [string]$PackageName = 'HitMarkersStalker2-Windows'
+    [string]$PackageName = 'HitMarkersStalker2-Windows',
+
+    [switch]$Diagnostics
 )
 
 $ErrorActionPreference = 'Stop'
@@ -151,12 +153,16 @@ if ($PatcherPath) {
 }
 
 if ([System.IO.Path]::GetExtension($resolvedPatcher) -eq '.dll') {
+    $patcherArguments = @($resolvedPatcher, $legacyDir, $patchedDir)
+    if ($Diagnostics) { $patcherArguments = @($resolvedPatcher, '--diagnostics', $legacyDir, $patchedDir) }
     Invoke-Checked -Executable 'dotnet' -Description 'HitMarkers cooked Blueprint patch' -Arguments @(
-        $resolvedPatcher, $legacyDir, $patchedDir
+        $patcherArguments
     )
 } else {
+    $patcherArguments = @($legacyDir, $patchedDir)
+    if ($Diagnostics) { $patcherArguments = @('--diagnostics', $legacyDir, $patchedDir) }
     Invoke-Checked -Executable $resolvedPatcher -Description 'HitMarkers cooked Blueprint patch' -Arguments @(
-        $legacyDir, $patchedDir
+        $patcherArguments
     )
 }
 
@@ -183,7 +189,7 @@ $manifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestPath -E
 Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers mounted container packaging' -Arguments @(
     'pack-raw', $rawDir, $outputUtoc
 )
-Copy-Item -LiteralPath (Resolve-RequiredFile -Path (Join-Path $zenDir "$PackageName.pak") -Name 'Unpacked companion .pak') `
+Copy-Item -LiteralPath (Resolve-RequiredFile -Path "$referenceBase.pak" -Name 'Reference companion .pak') `
     -Destination (Join-Path $resolvedOutputDir "$PackageName.pak") -Force
 Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers package verification' -Arguments @(
     'verify', $outputUtoc

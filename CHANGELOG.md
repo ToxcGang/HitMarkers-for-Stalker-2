@@ -11,3 +11,6 @@
 - Fixed HUD ownership, Z-order, spawn initialization, and fade cleanup so markers display immediately above other UI.
 - Reduced Agent discovery to a 0.5-second scan and added log-only `[HitMarkers]` initialization diagnostics.
 - Enforced the `../../../Stalker2/Content/` IoStore mount point and expanded cooked-asset packaging postconditions.
+- Enabled native `HittableComponent` hit broadcasting before delegate registration.
+- Moved marker display into holder initialization, disabled its polling Tick path, and made marker widgets explicitly owned, visible, and opaque.
+- Added optional diagnostic packaging for runtime hook and viewport tracing.

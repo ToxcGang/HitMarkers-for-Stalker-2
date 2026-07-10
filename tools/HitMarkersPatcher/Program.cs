@@ -15,9 +15,12 @@ if (args.Length == 2 && args[0] == "--verify")
     return 0;
 }
 
+var diagnostics = args.Length == 3 && args[0] == "--diagnostics";
+if (diagnostics) args = args[1..];
+
 if (args.Length != 2)
 {
-    Console.Error.WriteLine("Usage: HitMarkersPatcher <legacy-source> <legacy-output> | --verify <legacy-root>");
+    Console.Error.WriteLine("Usage: HitMarkersPatcher [--diagnostics] <legacy-source> <legacy-output> | --verify <legacy-root>");
     return 2;
 }
 
@@ -34,9 +37,9 @@ CopyDirectory(sourceRoot, outputRoot);
 
 PatchDamageWidget(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "wbp_ShowDMG.uasset"));
 PatchDamageArea(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "wbp_ShowDMGArea.uasset"));
-PatchHolder(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "bp_dmgActorHolder.uasset"));
-PatchSpawner(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "bpac_dmgWidgetSpawner.uasset"));
-PatchRunner(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "BP_Run_ModActor.uasset"));
+PatchHolder(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "bp_dmgActorHolder.uasset"), diagnostics);
+PatchSpawner(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "bpac_dmgWidgetSpawner.uasset"), diagnostics);
+PatchRunner(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "BP_Run_ModActor.uasset"), diagnostics);
 VerifyPatchedAssets(outputRoot);
 
 Console.WriteLine($"Patched HitMarkers assets in {outputRoot}");
@@ -92,6 +95,38 @@ static void PatchDamageArea(string path)
 {
     var asset = LoadAsset(path);
     var function = FunctionScript.Parse(asset, "showDamage");
+    var gameplayStatics = EnsureClass(asset, "/Script/Engine", "GameplayStatics");
+    var getPlayerController = EnsureObject(asset, gameplayStatics, "GetPlayerController");
+
+    var create = (EX_FinalFunction)((EX_Context)((EX_LetObj)function.At(0).Expression).AssignmentExpression).ContextExpression;
+    create.Parameters[2] = new EX_CallMath
+    {
+        StackNode = getPlayerController,
+        Parameters = new KismetExpression[] { new EX_Self(), new EX_IntConst { Value = 0 } }
+    };
+
+    var marker = Local(asset, "CallFunc_Create_ReturnValue", function.ExportIndex);
+    var visible = new ScriptStatement(null, "marker_visible", new EX_Context
+    {
+        ObjectExpression = marker,
+        RValuePointer = EmptyProperty(),
+        ContextExpression = new EX_VirtualFunction
+        {
+            VirtualFunctionName = new FName(asset, "SetVisibility"),
+            Parameters = new KismetExpression[] { new EX_ByteConst { Value = 0 } }
+        }
+    });
+    var opaque = new ScriptStatement(null, "marker_opaque", new EX_Context
+    {
+        ObjectExpression = marker,
+        RValuePointer = EmptyProperty(),
+        ContextExpression = new EX_VirtualFunction
+        {
+            VirtualFunctionName = new FName(asset, "SetRenderOpacity"),
+            Parameters = new KismetExpression[] { new EX_FloatConst { Value = 1f } }
+        }
+    });
+    function.Statements.InsertRange(function.Statements.IndexOf(function.At(53)), new[] { visible, opaque });
 
     foreach (var offset in new[] { 53, 99 })
     {
@@ -108,7 +143,7 @@ static void PatchDamageArea(string path)
     asset.Write(path);
 }
 
-static void PatchHolder(string path)
+static void PatchHolder(string path, bool diagnostics)
 {
     var asset = LoadAsset(path);
     var graph = FunctionScript.Parse(asset, "ExecuteUbergraph_bp_dmgActorHolder");
@@ -167,7 +202,17 @@ static void PatchHolder(string path)
     graph.InsertBefore(graph.At(566), new ScriptStatement(null, "kill_display", killDisplay));
     graph.PendingTargets[killJump] = "kill_display";
     graph.PendingTargets[afterDisplay] = "old:566";
-    graph.At(566).Expression = new EX_Nothing();
+    graph.At(566).Expression = showContext;
+
+    var cleanupDelay = graph.At(135);
+    graph.Statements.Remove(cleanupDelay);
+    graph.InsertAfter(graph.At(566), cleanupDelay);
+    if (diagnostics)
+    {
+        graph.InsertBefore(cleanupDelay, new ScriptStatement(null, "widget_diagnostic",
+            PrintLog(asset, "[HitMarkers][Diagnostic] widget created, inserted, visible, fade started")));
+    }
+    graph.At(81).Expression = new EX_Nothing();
 
     Visit(graph.At(135).Expression, asset, expression =>
     {
@@ -196,11 +241,11 @@ static void PatchHolder(string path)
 
     var holderMap = graph.FinalizeScript();
     UpdateEntrypoint(asset, "ReceiveBeginPlay", 215, holderMap[215]);
-    UpdateEntrypoint(asset, "ReceiveTick", 612, holderMap[612]);
+    UpdateEntrypoint(asset, "ReceiveTick", 612, holderMap[732]);
     asset.Write(path);
 }
 
-static void PatchSpawner(string path)
+static void PatchSpawner(string path, bool diagnostics)
 {
     var asset = LoadAsset(path);
     var graph = FunctionScript.Parse(asset, "ExecuteUbergraph_bpac_dmgWidgetSpawner");
@@ -400,7 +445,16 @@ static void PatchSpawner(string path)
     };
     var timeoutReturn = new EX_Jump();
     var finalReturn = graph.At(459);
-    graph.InsertBefore(finalReturn, new ScriptStatement(null, "bullet_event", hostilityCheck));
+    if (diagnostics)
+    {
+        graph.InsertBefore(finalReturn, new ScriptStatement(null, "bullet_event",
+            PrintLog(asset, "[HitMarkers][Diagnostic] BulletProjectileHit callback received")));
+        graph.InsertBefore(finalReturn, new ScriptStatement(null, "hostility_check", hostilityCheck));
+    }
+    else
+    {
+        graph.InsertBefore(finalReturn, new ScriptStatement(null, "bullet_event", hostilityCheck));
+    }
     graph.InsertBefore(finalReturn, new ScriptStatement(null, "uid_check", uidCheck));
     graph.InsertBefore(finalReturn, new ScriptStatement(null, "set_pending", setPending));
     graph.InsertBefore(finalReturn, new ScriptStatement(null, "confirmation_delay", confirmationDelay));
@@ -413,6 +467,15 @@ static void PatchSpawner(string path)
     graph.PendingTargets[latentTarget] = "pending_timeout";
     graph.PendingTargets[timeoutClear] = "old:356";
     graph.PendingTargets[timeoutReturn] = "old:459";
+    if (diagnostics)
+    {
+        graph.InsertBefore(hitCallStatement, new ScriptStatement(null, "confirmed_hit_log",
+            PrintLog(asset, "[HitMarkers][Diagnostic] confirmed enemy hit; displaying white marker")));
+        var killStatement = graph.Statements.Single(item => item.Tag == "kill_call");
+        graph.InsertBefore(killStatement, new ScriptStatement(null, "confirmed_kill_log",
+            PrintLog(asset, "[HitMarkers][Diagnostic] confirmed enemy kill; displaying red marker")));
+        graph.PendingTargets[killJump] = "confirmed_kill_log";
+    }
 
     var spawnerMap = graph.FinalizeScript();
     UpdateEntrypoint(asset, "ReceiveTick", 454, spawnerMap[454]);
@@ -464,7 +527,7 @@ static void PatchSpawner(string path)
     asset.Write(path);
 }
 
-static void PatchRunner(string path)
+static void PatchRunner(string path, bool diagnostics)
 {
     var asset = LoadAsset(path);
     var graph = FunctionScript.Parse(asset, "ExecuteUbergraph_BP_Run_ModActor");
@@ -482,6 +545,7 @@ static void PatchRunner(string path)
     var equalObject = EnsureObject(asset, mathLibrary, "EqualEqual_ObjectObject");
     var delayFunction = EnsureObject(asset, systemLibrary, "Delay");
     var printString = EnsureObject(asset, systemLibrary, "PrintString");
+    var setBroadcastHitPending = EnsureObject(asset, hittableClass, "SetBroadcastHitPending");
     var latentInfo = EnsureObject(asset, enginePackage, "LatentActionInfo");
     var linearColor = EnsureObject(asset, EnsurePackage(asset, "/Script/CoreUObject"), "LinearColor");
     var agentClass = FPackageIndex.FromImport(asset.Imports.FindIndex(item =>
@@ -575,9 +639,19 @@ static void PatchRunner(string path)
             },
             DelegateToAdd = Local(asset, "K2Node_CreateDelegate_OutputDelegate", graph.ExportIndex)
         });
+        var enableBroadcast = new ScriptStatement(null, $"{prefix}_enable_broadcast", new EX_Context
+        {
+            ObjectExpression = hittable,
+            RValuePointer = EmptyProperty(),
+            ContextExpression = new EX_FinalFunction
+            {
+                StackNode = setBroadcastHitPending,
+                Parameters = new KismetExpression[] { new EX_True() }
+            }
+        });
 
         var insertion = graph.Statements.IndexOf(anchor) + 1;
-        graph.Statements.InsertRange(insertion, new[] { setRelation, setHealth, bind, addDelegate });
+        graph.Statements.InsertRange(insertion, new[] { setRelation, setHealth, enableBroadcast, bind, addDelegate });
     }
 
     ReplaceInitialization(graph.At(1367), "Enemy", "enemy");
@@ -592,7 +666,9 @@ static void PatchRunner(string path)
         Parameters = new KismetExpression[]
         {
             new EX_Self(),
-            new EX_StringConst { Value = "[HitMarkers] initialized; binding BulletProjectileHit delegates" },
+            new EX_StringConst { Value = diagnostics
+                ? "[HitMarkers][Diagnostic] initialization, HUD wait, and delegate scan started"
+                : "[HitMarkers] initialized; BulletProjectileHit broadcasting enabled" },
             new EX_False(),
             new EX_True(),
             new EX_StructConst
@@ -689,6 +765,31 @@ static void SetLinearColor(KismetExpression expression, UAsset asset, params flo
     }
 }
 
+static EX_CallMath PrintLog(UAsset asset, string message)
+{
+    var systemLibrary = EnsureClass(asset, "/Script/Engine", "KismetSystemLibrary");
+    var printString = EnsureObject(asset, systemLibrary, "PrintString");
+    var color = EnsureObject(asset, EnsurePackage(asset, "/Script/CoreUObject"), "LinearColor");
+    return new EX_CallMath
+    {
+        StackNode = printString,
+        Parameters = new KismetExpression[]
+        {
+            new EX_Self(), new EX_StringConst { Value = message }, new EX_False(), new EX_True(),
+            new EX_StructConst
+            {
+                Struct = color, StructSize = 16,
+                Value = new KismetExpression[]
+                {
+                    new EX_FloatConst { Value = 1f }, new EX_FloatConst { Value = 1f },
+                    new EX_FloatConst { Value = 1f }, new EX_FloatConst { Value = 1f }
+                }
+            },
+            new EX_FloatConst { Value = 1f }, new EX_NameConst { Value = new FName(asset, "None") }
+        }
+    };
+}
+
 static void Visit(KismetExpression expression, UAsset asset, Action<KismetExpression> visitor)
 {
     uint offset = 0;
@@ -737,6 +838,9 @@ static void VerifyPatchedAssets(string root)
     Require(runnerNodes.OfType<EX_BindDelegate>().Count(item =>
         item.FunctionName.Value.Value == "OnBulletProjectileHit") == 2, "delegate bindings");
     Require(runnerNodes.OfType<EX_AddMulticastDelegate>().Count() == 2, "multicast delegate additions");
+    Require(runnerNodes.OfType<EX_FinalFunction>().Count(item =>
+        StackName(item.StackNode, runnerAsset) == "SetBroadcastHitPending") == 2,
+        "native hit broadcast enablement");
     Require(runnerNodes.OfType<EX_FloatConst>().Any(item => Math.Abs(item.Value - 0.5f) < 0.001f),
         "0.5-second agent scan");
     Require(runnerNodes.OfType<EX_StringConst>().Any(item =>
@@ -791,6 +895,16 @@ static void VerifyPatchedAssets(string root)
         "owning player widget creation");
     Require(holderNodes.OfType<EX_FloatConst>().Any(item => Math.Abs(item.Value - 1.1f) < 0.001f),
         "fade cleanup timing");
+
+    var areaAsset = LoadAsset(Path.Combine(modRoot, "wbp_ShowDMGArea.uasset"));
+    var area = FunctionScript.Parse(areaAsset, "showDamage");
+    var areaNodes = Flatten(area, areaAsset);
+    Require(areaNodes.OfType<EX_CallMath>().Any(item => StackName(item.StackNode, areaAsset) == "GetPlayerController"),
+        "marker widget owning player");
+    Require(areaNodes.OfType<EX_VirtualFunction>().Any(item => item.VirtualFunctionName.Value.Value == "SetVisibility"),
+        "marker visibility initialization");
+    Require(areaNodes.OfType<EX_VirtualFunction>().Any(item => item.VirtualFunctionName.Value.Value == "SetRenderOpacity"),
+        "marker opacity initialization");
 }
 
 static List<KismetExpression> Flatten(FunctionScript function, UAsset asset)
@@ -897,6 +1011,9 @@ static FPackageIndex EnsureObject(UAsset asset, FPackageIndex owner, string obje
 
 static KismetPropertyPointer Property(UAsset asset, string name, FPackageIndex owner) =>
     new(new FFieldPath(new[] { new FName(asset, name) }, owner));
+
+static KismetPropertyPointer EmptyProperty() =>
+    new(new FFieldPath(Array.Empty<FName>(), FPackageIndex.FromRawIndex(0)));
 
 static EX_LocalVariable Local(UAsset asset, string name, FPackageIndex owner) =>
     new() { Variable = Property(asset, name, owner) };
