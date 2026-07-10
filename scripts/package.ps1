@@ -87,7 +87,9 @@ $referenceDir = Join-Path $resolvedWorkDir 'reference'
 $combinedDir = Join-Path $resolvedWorkDir 'combined-paks'
 $legacyDir = Join-Path $resolvedWorkDir 'legacy-source'
 $patchedDir = Join-Path $resolvedWorkDir 'legacy-patched'
-New-Item -ItemType Directory -Force -Path $referenceDir, $combinedDir, $legacyDir, $patchedDir, $resolvedOutputDir | Out-Null
+$zenDir = Join-Path $resolvedWorkDir 'zen-unmounted'
+$rawDir = Join-Path $resolvedWorkDir 'raw-mounted'
+New-Item -ItemType Directory -Force -Path $referenceDir, $combinedDir, $legacyDir, $patchedDir, $zenDir, $resolvedOutputDir | Out-Null
 
 if ($ReferenceArchive) {
     $resolvedArchive = Resolve-RequiredFile -Path $ReferenceArchive -Name 'Damage Numbers 2.0 reference archive'
@@ -159,6 +161,7 @@ if ([System.IO.Path]::GetExtension($resolvedPatcher) -eq '.dll') {
 }
 
 $outputUtoc = Join-Path $resolvedOutputDir "$PackageName.utoc"
+$unmountedUtoc = Join-Path $zenDir "$PackageName.utoc"
 foreach ($extension in '.pak', '.ucas', '.utoc') {
     $stalePackage = Join-Path $resolvedOutputDir "$PackageName$extension"
     if (Test-Path -LiteralPath $stalePackage) {
@@ -166,11 +169,36 @@ foreach ($extension in '.pak', '.ucas', '.utoc') {
     }
 }
 Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers IoStore packaging' -Arguments @(
-    'to-zen', $patchedDir, $outputUtoc, '--version', 'UE5_1'
+    'to-zen', $patchedDir, $unmountedUtoc, '--version', 'UE5_1'
 )
+Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers raw container extraction' -Arguments @(
+    'unpack-raw', $unmountedUtoc, $rawDir
+)
+
+$manifestPath = Resolve-RequiredFile -Path (Join-Path $rawDir 'manifest.json') -Name 'Raw container manifest'
+$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+$manifest.mount_point = '../../../Stalker2/Content/'
+$manifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+
+Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers mounted container packaging' -Arguments @(
+    'pack-raw', $rawDir, $outputUtoc
+)
+Copy-Item -LiteralPath (Resolve-RequiredFile -Path (Join-Path $zenDir "$PackageName.pak") -Name 'Unpacked companion .pak') `
+    -Destination (Join-Path $resolvedOutputDir "$PackageName.pak") -Force
 Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers package verification' -Arguments @(
     'verify', $outputUtoc
 )
+
+$containerInfo = (& $resolvedRetoc 'info' $outputUtoc | Out-String)
+if ($LASTEXITCODE -ne 0) {
+    throw "HitMarkers container inspection failed with exit code $LASTEXITCODE."
+}
+if ($containerInfo -notmatch [regex]::Escape('mount_point: ../../../Stalker2/Content/')) {
+    throw "HitMarkers mount point postcondition failed.`n$containerInfo"
+}
+if ($containerInfo -notmatch 'packages:\s+7') {
+    throw "HitMarkers cooked package count postcondition failed.`n$containerInfo"
+}
 
 $packageFiles = foreach ($extension in '.pak', '.ucas', '.utoc') {
     Resolve-RequiredFile -Path (Join-Path $resolvedOutputDir "$PackageName$extension") -Name "Built $extension package"
