@@ -1,9 +1,8 @@
-# Unreal build output
-Binaries/
-Build/
-DerivedDataCache/
-Intermediate/
-Saved/
+# Local tools and build intermediates
+.tools/
+.build/
+**/bin/
+**/obj/
 
 # Packaged mod artifacts
 dist/
@@ -11,10 +10,6 @@ dist/
 *.ucas
 *.utoc
 *.sig
-
-# Local cooked input directory
-CookedContent/*
-!CookedContent/.gitkeep
 
 # Logs and temp files
 *.log

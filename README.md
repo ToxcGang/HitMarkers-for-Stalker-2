@@ -9,9 +9,9 @@ HitMarkers adds a small on-screen marker when the player damages enemies in S.T.
 
 ## Installation
 
-1. Download the latest HitMarkers release package.
+1. Download and extract the latest HitMarkers release package.
 2. Open your S.T.A.L.K.E.R. 2 installation folder.
 3. Go to `Stalker2\Content\Paks`.
 4. Create a folder named `~mods` if it does not already exist.
-5. Copy the HitMarkers package files into `Stalker2\Content\Paks\~mods`.
+5. Copy `HitMarkersStalker2-Windows.pak`, `HitMarkersStalker2-Windows.ucas`, and `HitMarkersStalker2-Windows.utoc` into `Stalker2\Content\Paks\~mods`.
 6. Launch the game.

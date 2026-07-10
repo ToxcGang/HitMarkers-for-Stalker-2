@@ -5,4 +5,4 @@
 - Initial release.
 - Added white hit markers for enemy hits.
 - Added red hit markers for enemy kills.
-- Added Generic UnrealPak project structure, packaging script, install script, and repository documentation.
+- Added the autoloaded IoStore package, cooked Blueprint patcher, packaging script, install script, and repository documentation.

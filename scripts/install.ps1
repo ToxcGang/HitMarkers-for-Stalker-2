@@ -3,11 +3,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$GameRoot,
 
-    [Parameter(Mandatory = $true)]
-    [string]$PackagePath
+    [string]$PackagePath = (Join-Path $PSScriptRoot '..\dist')
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 
 if (-not (Test-Path -LiteralPath $GameRoot -PathType Container)) {
     throw "Game root was not found: $GameRoot"
@@ -23,17 +23,20 @@ if (-not (Test-Path -LiteralPath $PackagePath)) {
 }
 
 $packageItem = Get-Item -LiteralPath $PackagePath
-
 if ($packageItem.PSIsContainer) {
-    $packageFiles = Get-ChildItem -LiteralPath $packageItem.FullName -File |
-        Where-Object { $_.Extension -in '.pak', '.ucas', '.utoc' }
+    $packageRoot = $packageItem.FullName
+    $packageBase = Join-Path $packageRoot 'HitMarkersStalker2-Windows'
 } else {
-    $packageFiles = @($packageItem) |
-        Where-Object { $_.Extension -in '.pak', '.ucas', '.utoc' }
+    $packageRoot = $packageItem.DirectoryName
+    $packageBase = Join-Path $packageRoot $packageItem.BaseName
 }
 
-if (-not $packageFiles) {
-    throw "No .pak, .ucas, or .utoc package files were found in: $PackagePath"
+$packageFiles = foreach ($extension in '.pak', '.ucas', '.utoc') {
+    $file = "$packageBase$extension"
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+        throw "The package trio is incomplete; missing $file"
+    }
+    Get-Item -LiteralPath $file
 }
 
 $modsDir = Join-Path $paksDir '~mods'
