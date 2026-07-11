@@ -43,6 +43,14 @@ $modsDir = Join-Path $paksDir '~mods'
 New-Item -ItemType Directory -Force -Path $modsDir | Out-Null
 
 foreach ($file in $packageFiles) {
-    Copy-Item -LiteralPath $file.FullName -Destination $modsDir -Force
+    $destination = Join-Path $modsDir $file.Name
+    Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+    $sourceHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+    $installedHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+    if ($sourceHash -ne $installedHash) {
+        throw "Installed package hash mismatch for $($file.Name)."
+    }
     Write-Host "Installed $($file.Name) to $modsDir"
 }
+
+Write-Host 'Verified installed package hashes.'

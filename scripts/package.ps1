@@ -149,22 +149,20 @@ if ($PatcherPath) {
     Invoke-Checked -Executable 'dotnet' -Description 'HitMarkers patcher build' -Arguments @(
         'build', $patcherProject, '--configuration', 'Release', '--no-restore'
     )
-    $resolvedPatcher = Resolve-RequiredFile -Path (Join-Path $patcherDirectory 'bin\Release\net8.0\HitMarkersPatcher.dll') -Name 'Built HitMarkers patcher'
+    $resolvedPatcher = Resolve-RequiredFile -Path (Join-Path $patcherDirectory 'bin\Release\net8.0\HitMarkersPatcher.exe') -Name 'Built HitMarkers patcher apphost'
 }
 
-if ([System.IO.Path]::GetExtension($resolvedPatcher) -eq '.dll') {
-    $patcherArguments = @($resolvedPatcher, $legacyDir, $patchedDir)
-    if ($Diagnostics) { $patcherArguments = @($resolvedPatcher, '--diagnostics', $legacyDir, $patchedDir) }
-    Invoke-Checked -Executable 'dotnet' -Description 'HitMarkers cooked Blueprint patch' -Arguments @(
-        $patcherArguments
-    )
-} else {
-    $patcherArguments = @($legacyDir, $patchedDir)
-    if ($Diagnostics) { $patcherArguments = @('--diagnostics', $legacyDir, $patchedDir) }
-    Invoke-Checked -Executable $resolvedPatcher -Description 'HitMarkers cooked Blueprint patch' -Arguments @(
-        $patcherArguments
-    )
+if ([System.IO.Path]::GetExtension($resolvedPatcher) -ne '.exe') {
+    throw "PatcherPath must be the HitMarkersPatcher.exe apphost: $resolvedPatcher"
 }
+$patcherArguments = @($legacyDir, $patchedDir)
+if ($Diagnostics) { $patcherArguments = @('--diagnostics', $legacyDir, $patchedDir) }
+Invoke-Checked -Executable $resolvedPatcher -Description 'HitMarkers cooked Blueprint patch' -Arguments @(
+    $patcherArguments
+)
+Invoke-Checked -Executable $resolvedPatcher -Description 'Independent cooked Blueprint verification' -Arguments @(
+    '--verify', $patchedDir
+)
 
 $outputUtoc = Join-Path $resolvedOutputDir "$PackageName.utoc"
 $unmountedUtoc = Join-Path $zenDir "$PackageName.utoc"

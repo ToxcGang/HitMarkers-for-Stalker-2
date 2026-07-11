@@ -543,6 +543,7 @@ static void PatchRunner(string path, bool diagnostics)
     var getFocusedEnemy = EnsureObject(asset, cppMediator, "GetFocusedEnemy");
     var booleanOr = EnsureObject(asset, mathLibrary, "BooleanOR");
     var equalObject = EnsureObject(asset, mathLibrary, "EqualEqual_ObjectObject");
+    var equalInt = EnsureObject(asset, mathLibrary, "EqualEqual_IntInt");
     var delayFunction = EnsureObject(asset, systemLibrary, "Delay");
     var printString = EnsureObject(asset, systemLibrary, "PrintString");
     var setBroadcastHitPending = EnsureObject(asset, hittableClass, "SetBroadcastHitPending");
@@ -650,8 +651,41 @@ static void PatchRunner(string path, bool diagnostics)
             }
         });
 
+        var additions = new List<ScriptStatement> { setRelation, setHealth, enableBroadcast, bind, addDelegate };
+        if (diagnostics)
+        {
+            var skipCanary = new EX_JumpIfNot
+            {
+                BooleanExpression = new EX_CallMath
+                {
+                    StackNode = equalInt,
+                    Parameters = new KismetExpression[]
+                    {
+                        Local(asset, "Temp_int_Loop_Counter_Variable", graph.ExportIndex),
+                        new EX_IntConst { Value = 0 }
+                    }
+                }
+            };
+            additions.Add(new ScriptStatement(null, $"{prefix}_canary_check", skipCanary));
+            additions.Add(new ScriptStatement(null, $"{prefix}_canary", new EX_Context
+            {
+                ObjectExpression = component,
+                RValuePointer = EmptyProperty(),
+                ContextExpression = new EX_LocalVirtualFunction
+                {
+                    VirtualFunctionName = new FName(asset, "showDamage"),
+                    Parameters = new KismetExpression[]
+                    {
+                        new EX_IntConst { Value = 1 }, new EX_StringConst { Value = "Hit" }
+                    }
+                }
+            }));
+            additions.Add(new ScriptStatement(null, $"{prefix}_after_canary", new EX_Nothing()));
+            graph.PendingTargets[skipCanary] = $"{prefix}_after_canary";
+        }
+
         var insertion = graph.Statements.IndexOf(anchor) + 1;
-        graph.Statements.InsertRange(insertion, new[] { setRelation, setHealth, enableBroadcast, bind, addDelegate });
+        graph.Statements.InsertRange(insertion, additions);
     }
 
     ReplaceInitialization(graph.At(1367), "Enemy", "enemy");
