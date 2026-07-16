@@ -58,6 +58,17 @@ The conversion control is expected to display the original damage numbers in-gam
 
 This mode keeps the working reference's original Zen package headers and untouched raw chunks. It applies only equal-length export changes, transplants them into the original widget chunk, and creates `dist\HitMarkers-DirectHudControl.zip`. The control uses ShowDMG's proven damage and viewport flow to display a white `X` instead of its numeric value; it does not patch the runner, subsystem, spawner, or damage hooks.
 
+After the direct HUD control succeeds in-game, build the release through the same direct-container path:
+
+```powershell
+.\scripts\package.ps1 `
+    -RetocPath 'C:\Tools\retoc.exe' `
+    -GameRoot 'C:\Program Files (x86)\Steam\steamapps\common\S.T.A.L.K.E.R. 2 Heart of Chornobyl' `
+    -DirectRelease
+```
+
+The direct release preserves the working bootstrap and original package headers. It adds an equal-length HP-zero branch to the proven polling component: surviving enemy damage displays an opaque white marker, lethal damage displays an opaque red marker, and friendly damage takes a transparent branch. The output remains `dist\HitMarkers-1.0.0.zip`.
+
 After the control succeeds, build the bootstrap-only diagnostic package with `-BootstrapDiagnostics`. This preserves the working reference's internal container identity, chunk map, perfect-hash lookup, and directory index while adding only runner-startup and HUD-canary diagnostics. It does not enable or bind damage-event hooks.
 
 ## Install

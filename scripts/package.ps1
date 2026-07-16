@@ -22,6 +22,8 @@ param(
 
     [switch]$DirectHudControl,
 
+    [switch]$DirectRelease,
+
     [switch]$BootstrapDiagnostics,
 
     [switch]$Diagnostics
@@ -33,9 +35,11 @@ Set-StrictMode -Version Latest
 $referenceUrl = 'https://g-5761.modapi.io/v1/games/5761/mods/5256912/files/6800765/download'
 $referenceSha256 = 'F5D37FD3D55BC3B79CB5BA564C9ABF7A3365647D40675D6F6985B624C800C82B'
 
-if (@($ReferenceControl, $ConversionControl, $DirectHudControl, $BootstrapDiagnostics, $Diagnostics).Where({ $_ }).Count -gt 1) {
-    throw 'ReferenceControl, ConversionControl, DirectHudControl, BootstrapDiagnostics, and Diagnostics are mutually exclusive.'
+if (@($ReferenceControl, $ConversionControl, $DirectHudControl, $DirectRelease, $BootstrapDiagnostics, $Diagnostics).Where({ $_ }).Count -gt 1) {
+    throw 'ReferenceControl, ConversionControl, DirectHudControl, DirectRelease, BootstrapDiagnostics, and Diagnostics are mutually exclusive.'
 }
+
+$directContainerPatch = $DirectHudControl -or $DirectRelease
 
 function Resolve-RequiredFile {
     param(
@@ -286,6 +290,13 @@ if ($ConversionControl) {
     Invoke-Checked -Executable $resolvedPatcher -Description 'Independent direct HUD asset verification' -Arguments @(
         '--verify-direct-hud-control', $legacyDir, $patchedDir
     )
+} elseif ($DirectRelease) {
+    Invoke-Checked -Executable $resolvedPatcher -Description 'Length-preserving direct release asset patch' -Arguments @(
+        '--direct-release', $legacyDir, $patchedDir
+    )
+    Invoke-Checked -Executable $resolvedPatcher -Description 'Independent direct release asset verification' -Arguments @(
+        '--verify-direct-release', $legacyDir, $patchedDir
+    )
 } else {
     Invoke-Checked -Executable $resolvedPatcher -Description 'HitMarkers cooked Blueprint patch' -Arguments @(
         $patcherArguments
@@ -321,7 +332,7 @@ foreach ($extension in '.pak', '.ucas', '.utoc') {
 Invoke-Checked -Executable $resolvedRetoc -Description 'Working reference raw container extraction' -Arguments @(
     'unpack-raw', $referenceUtoc.FullName, $referenceRawDir
 )
-if ($DirectHudControl) {
+if ($directContainerPatch) {
     Invoke-Checked -Executable $resolvedPatcher -Description 'Direct HUD export transplant into original Zen chunks' -Arguments @(
         '--transplant-legacy-exports', $referenceRawDir, $legacyDir, $patchedDir, $rawDir
     )
@@ -367,7 +378,7 @@ Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers raw round-tri
 $roundTripManifest = Resolve-RequiredFile -Path (Join-Path $roundTripRawDir 'manifest.json') -Name 'Round-trip raw manifest'
 Assert-RawManifestEquivalent -ReferenceManifest $referenceManifest -CandidateManifest $roundTripManifest `
     -Description 'Round-trip HitMarkers manifest'
-if ($DirectHudControl) {
+if ($directContainerPatch) {
     Invoke-Checked -Executable $resolvedPatcher -Description 'Round-trip direct HUD Zen transplant verification' -Arguments @(
         '--verify-transplanted-exports', $referenceRawDir, $legacyDir, $patchedDir, $roundTripRawDir
     )
@@ -412,6 +423,10 @@ if ($ConversionControl) {
 } elseif ($DirectHudControl) {
     Invoke-Checked -Executable $resolvedPatcher -Description 'Direct HUD legacy round-trip verification' -Arguments @(
         '--verify-direct-hud-control', $legacyDir, $legacyRoundTripDir
+    )
+} elseif ($DirectRelease) {
+    Invoke-Checked -Executable $resolvedPatcher -Description 'Direct release legacy round-trip verification' -Arguments @(
+        '--verify-direct-release', $legacyDir, $legacyRoundTripDir
     )
 } else {
     Invoke-Checked -Executable $resolvedPatcher -Description 'Legacy round-trip cooked Blueprint verification' -Arguments @(

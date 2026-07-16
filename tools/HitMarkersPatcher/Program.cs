@@ -63,6 +63,33 @@ if (args.Length == 3 && args[0] == "--verify-direct-hud-control")
     return 0;
 }
 
+if (args.Length == 3 && args[0] == "--direct-release")
+{
+    var directSourceRoot = Path.GetFullPath(args[1]);
+    var directOutputRoot = Path.GetFullPath(args[2]);
+    if (!Directory.Exists(directSourceRoot))
+    {
+        throw new DirectoryNotFoundException($"Direct release source directory not found: {directSourceRoot}");
+    }
+
+    CopyDirectory(directSourceRoot, directOutputRoot);
+    var directModRoot = Path.Combine(directOutputRoot, "Stalker2", "Content", "Mods", "ShowDMG");
+    PatchDirectReleaseWidget(Path.Combine(directModRoot, "wbp_ShowDMG.uasset"));
+    PatchDirectReleaseSpawner(Path.Combine(directModRoot, "bpac_dmgWidgetSpawner.uasset"));
+    VerifyDirectReleaseAssets(directSourceRoot, directOutputRoot);
+    Console.WriteLine($"Patched length-preserving direct release assets in {directOutputRoot}");
+    return 0;
+}
+
+if (args.Length == 3 && args[0] == "--verify-direct-release")
+{
+    var directSourceRoot = Path.GetFullPath(args[1]);
+    var directCandidateRoot = Path.GetFullPath(args[2]);
+    VerifyDirectReleaseAssets(directSourceRoot, directCandidateRoot);
+    Console.WriteLine($"Verified length-preserving direct release assets in {directCandidateRoot}");
+    return 0;
+}
+
 if (args.Length == 5 && args[0] == "--transplant-legacy-exports")
 {
     var referenceRawRoot = Path.GetFullPath(args[1]);
@@ -101,7 +128,7 @@ if (diagnostics || bootstrapDiagnostics) args = args[1..];
 
 if (args.Length != 2)
 {
-    Console.Error.WriteLine("Usage: HitMarkersPatcher [--diagnostics|--bootstrap-diagnostics] <legacy-source> <legacy-output> | --verify|--verify-bootstrap <legacy-root> | --direct-hud-control <legacy-source> <legacy-output> | --verify-direct-hud-control <legacy-source> <legacy-candidate> | --transplant-legacy-exports <reference-raw> <legacy-source> <legacy-patched> <output-raw> | --verify-transplanted-exports <reference-raw> <legacy-source> <legacy-patched> <candidate-raw> | --restore-container-index <reference.utoc> <generated.utoc> <output.utoc> | --verify-container-index <reference.utoc> <candidate.utoc> | --verify-conversion-control <reference-root> <candidate-root>");
+    Console.Error.WriteLine("Usage: HitMarkersPatcher [--diagnostics|--bootstrap-diagnostics] <legacy-source> <legacy-output> | --verify|--verify-bootstrap <legacy-root> | --direct-hud-control|--direct-release <legacy-source> <legacy-output> | --verify-direct-hud-control|--verify-direct-release <legacy-source> <legacy-candidate> | --transplant-legacy-exports <reference-raw> <legacy-source> <legacy-patched> <output-raw> | --verify-transplanted-exports <reference-raw> <legacy-source> <legacy-patched> <candidate-raw> | --restore-container-index <reference.utoc> <generated.utoc> <output.utoc> | --verify-container-index <reference.utoc> <candidate.utoc> | --verify-conversion-control <reference-root> <candidate-root>");
     return 2;
 }
 
@@ -282,6 +309,205 @@ static void PatchDirectHudControlWidget(string path)
     asset.Write(path);
 }
 
+static void PatchDirectReleaseWidget(string path)
+{
+    var asset = LoadAsset(path);
+    var function = FunctionScript.Parse(asset, "ShowDamage");
+    var functionExport = asset.Exports.OfType<RawExport>()
+        .Single(export => export.ObjectName.Value.Value == "ShowDamage");
+    var originalFunctionLength = functionExport.Data.Length;
+
+    SetLinearColor(function.At(99).Expression, asset, 1f, 0f, 0f, 1f);
+    SetLinearColor(function.At(344).Expression, asset, 1f, 1f, 1f, 0f);
+    SetLinearColor(function.At(401).Expression, asset, 1f, 1f, 1f, 1f);
+
+    var skipNumericText = new EX_Jump();
+    function.At(151).Expression = skipNumericText;
+    function.PendingTargets[(EX_JumpIfNot)function.At(35).Expression] = "old:344";
+    function.PendingTargets[(EX_JumpIfNot)function.At(85).Expression] = "old:401";
+    function.PendingTargets[skipNumericText] = "old:245";
+    function.PendingTargets[(EX_Jump)function.At(339).Expression] = "old:458";
+    function.PendingTargets[(EX_Jump)function.At(396).Expression] = "old:245";
+    function.PendingTargets[(EX_Jump)function.At(453).Expression] = "old:245";
+
+    FinalizeWithStoragePadding(function, functionExport, function.At(245), originalFunctionLength,
+        "direct_release_widget_padding");
+
+    var textBlock = asset.Exports.OfType<RawExport>()
+        .Single(export => export.ObjectName.Value.Value == "TXT_DMG");
+    ReplaceSingle(textBlock.Data, new byte[] { 0x31, 0x30, 0x30, 0x00 }, new byte[] { 0x20, 0x58, 0x20, 0x00 });
+    asset.Write(path);
+}
+
+static void PatchDirectReleaseSpawner(string path)
+{
+    var asset = LoadAsset(path);
+    var tickTarget = ReadEntrypoint(asset, "ReceiveTick");
+    var tickExport = asset.Exports.OfType<RawExport>()
+        .Single(export => export.ObjectName.Value.Value == "ReceiveTick");
+    var originalTickLength = tickExport.Data.Length;
+    var graph = FunctionScript.Parse(asset, "ExecuteUbergraph_bpac_dmgWidgetSpawner");
+    var graphExport = asset.Exports.OfType<RawExport>()
+        .Single(export => export.ObjectName.Value.Value == "ExecuteUbergraph_bpac_dmgWidgetSpawner");
+    var originalGraphLength = graphExport.Data.Length;
+
+    var damageComparison = (EX_LetBool)graph.At(123).Expression;
+    var greaterCall = (EX_CallMath)damageComparison.AssignmentExpression;
+    var currentHp = Local(asset, "CallFunc_Greater_DoubleDouble_B_ImplicitCast", graph.ExportIndex);
+    var subtractCall = (EX_CallMath)((EX_Let)graph.At(241).Expression).Expression;
+    subtractCall.Parameters[1] = currentHp;
+    ((EX_Let)graph.At(422).Expression).Expression = currentHp;
+
+    foreach (var offset in new[] { 175, 212, 356, 393 })
+    {
+        graph.Statements.Remove(graph.At(offset));
+    }
+
+    var aliveTest = new EX_LetBool
+    {
+        VariableExpression = damageComparison.VariableExpression,
+        AssignmentExpression = new EX_CallMath
+        {
+            StackNode = greaterCall.StackNode,
+            Parameters = new KismetExpression[] { currentHp, new EX_DoubleConst { Value = 0d } }
+        }
+    };
+    var killJump = new EX_JumpIfNot
+    {
+        BooleanExpression = damageComparison.VariableExpression
+    };
+    var skipKill = new EX_Jump();
+    var hitCallStatement = graph.At(324);
+    var hitCall = (EX_LocalVirtualFunction)hitCallStatement.Expression;
+    var killCall = new EX_LocalVirtualFunction
+    {
+        VirtualFunctionName = hitCall.VirtualFunctionName,
+        Parameters = new KismetExpression[]
+        {
+            hitCall.Parameters[0], new EX_StringConst { Value = "Kill" }
+        }
+    };
+
+    graph.InsertBefore(hitCallStatement, new ScriptStatement(null, "direct_alive_test", aliveTest));
+    graph.InsertBefore(hitCallStatement, new ScriptStatement(null, "direct_kill_jump", killJump));
+    graph.InsertAfter(hitCallStatement, new ScriptStatement(null, "direct_skip_kill", skipKill));
+    graph.InsertBefore(graph.At(422), new ScriptStatement(null, "direct_kill_call", killCall));
+
+    graph.PendingTargets[(EX_JumpIfNot)graph.At(43).Expression] = "old:459";
+    graph.PendingTargets[(EX_JumpIfNot)graph.At(161).Expression] = "old:422";
+    graph.PendingTargets[killJump] = "direct_kill_call";
+    graph.PendingTargets[skipKill] = "old:422";
+    graph.PendingTargets[(EX_Jump)graph.At(449).Expression] = "old:459";
+    graph.PendingTargets[(EX_Jump)graph.At(454).Expression] = "old:10";
+
+    var graphMap = FinalizeWithStoragePadding(graph, graphExport, graph.At(454), originalGraphLength,
+        "direct_release_spawner_padding");
+    UpdateEntrypoint(asset, "ReceiveTick", tickTarget, graphMap[tickTarget]);
+    if (tickExport.Data.Length != originalTickLength)
+    {
+        throw new InvalidDataException("Direct release patch changed the ReceiveTick export length.");
+    }
+
+    asset.Write(path);
+}
+
+static Dictionary<int, uint> FinalizeWithStoragePadding(
+    FunctionScript function,
+    RawExport functionExport,
+    ScriptStatement paddingAnchor,
+    int requiredLength,
+    string tagPrefix)
+{
+    function.FinalizeScript();
+    var deficit = requiredLength - functionExport.Data.Length;
+    if (deficit < 0)
+    {
+        throw new InvalidDataException(
+            $"Length-preserving patch exceeded its export by {-deficit} byte(s).");
+    }
+
+    if (deficit > 0)
+    {
+        var insertion = function.Statements.IndexOf(paddingAnchor);
+        function.Statements.InsertRange(insertion, Enumerable.Range(0, deficit)
+            .Select(index => new ScriptStatement(null, $"{tagPrefix}_{index}", new EX_Nothing())));
+    }
+
+    var finalMap = function.FinalizeScript();
+    if (functionExport.Data.Length != requiredLength)
+    {
+        throw new InvalidDataException(
+            $"Length-preserving patch produced {functionExport.Data.Length} bytes; expected {requiredLength}.");
+    }
+    return finalMap;
+}
+
+static void VerifyDirectReleaseAssets(string sourceRoot, string candidateRoot)
+{
+    var patches = CollectLegacyExportPatches(sourceRoot, candidateRoot);
+    var expected = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMG.uasset|ShowDamage",
+        @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMG.uasset|TXT_DMG",
+        @"Stalker2\Content\Mods\ShowDMG\bpac_dmgWidgetSpawner.uasset|ExecuteUbergraph_bpac_dmgWidgetSpawner",
+        @"Stalker2\Content\Mods\ShowDMG\bpac_dmgWidgetSpawner.uasset|ReceiveTick"
+    };
+    var actual = patches.Select(patch => $"{patch.RelativeAssetPath}|{patch.ExportName}")
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    if (!actual.SetEquals(expected))
+    {
+        throw new InvalidDataException(
+            $"Direct release changed an unexpected export set: {string.Join(", ", actual.Order())}");
+    }
+
+    var modRoot = Path.Combine(candidateRoot, "Stalker2", "Content", "Mods", "ShowDMG");
+    var widget = LoadAsset(Path.Combine(modRoot, "wbp_ShowDMG.uasset"));
+    var showMarker = FunctionScript.Parse(widget, "ShowDamage");
+    var markerJump = showMarker.At(151).Expression as EX_Jump
+        ?? throw new InvalidDataException("Direct release does not bypass numeric text conversion.");
+    var markerTarget = showMarker.Statements.SingleOrDefault(statement =>
+        statement.OriginalOffset == checked((int)markerJump.CodeOffset));
+    Require(markerTarget is not null && FlattenExpression(markerTarget.Expression, widget)
+        .OfType<EX_FinalFunction>().Any(call => StackName(call.StackNode, widget) == "PlayAnimation"),
+        "direct release marker jump targets the fade animation");
+
+    var colors = showMarker.Statements
+        .Select(statement => ReadLinearColor(statement.Expression, widget))
+        .Where(color => color.Length == 4)
+        .ToArray();
+    Require(colors.Length == 3, "direct release retains exactly three marker color branches");
+    Require(ColorEquals(colors[0], 1f, 0f, 0f, 1f), "kill marker is opaque red");
+    Require(ColorEquals(colors[1], 1f, 1f, 1f, 0f), "friendly marker is transparent");
+    Require(ColorEquals(colors[2], 1f, 1f, 1f, 1f), "enemy hit marker is opaque white");
+    var textBlock = widget.Exports.OfType<RawExport>()
+        .Single(export => export.ObjectName.Value.Value == "TXT_DMG");
+    Require(textBlock.Data.AsSpan().IndexOf(new byte[] { 0x20, 0x58, 0x20, 0x00 }) >= 0,
+        "direct release marker text exists");
+
+    var spawner = LoadAsset(Path.Combine(modRoot, "bpac_dmgWidgetSpawner.uasset"));
+    var tickTarget = ReadEntrypoint(spawner, "ReceiveTick");
+    var graph = FunctionScript.Parse(spawner, "ExecuteUbergraph_bpac_dmgWidgetSpawner");
+    var tickEntry = graph.Statements.SingleOrDefault(statement => statement.OriginalOffset == tickTarget);
+    Require(tickEntry?.Expression is EX_Jump tickJump && tickJump.CodeOffset == 10,
+        "direct release ReceiveTick targets the preserved polling flow");
+    var graphNodes = Flatten(graph, spawner);
+    Require(graphNodes.OfType<EX_CallMath>().Count(call => StackName(call.StackNode, spawner) == "ObjGetHP") == 1,
+        "direct release polls HP once per tick");
+    Require(graphNodes.OfType<EX_CallMath>().Count(call => StackName(call.StackNode, spawner) == "Greater_DoubleDouble") == 2,
+        "direct release contains damage and alive comparisons");
+    var markerCalls = graphNodes.OfType<EX_LocalVirtualFunction>()
+        .Where(call => call.VirtualFunctionName.Value.Value == "showDamage").ToArray();
+    Require(markerCalls.Length == 2, "direct release contains one hit and one kill display call");
+    Require(markerCalls.Count(call => call.Parameters.ElementAtOrDefault(1) is EX_InstanceVariable relation &&
+        relation.Variable.New.Path.Any(name => name.Value.Value == "Rel")) == 1,
+        "direct release hit call preserves enemy relation classification");
+    Require(markerCalls.Count(call => call.Parameters.ElementAtOrDefault(1) is EX_StringConst type &&
+        type.Value == "Kill") == 1,
+        "direct release lethal call selects the red marker branch");
+    Require(graphNodes.OfType<EX_DoubleConst>().Any(value => Math.Abs(value.Value) < 0.0001d),
+        "direct release lethal test compares current HP with zero");
+}
+
 static void VerifyDirectHudControlAssets(string sourceRoot, string candidateRoot)
 {
     var patches = CollectLegacyExportPatches(sourceRoot, candidateRoot);
@@ -421,12 +647,23 @@ static void RequireSameAssetStructure(UAsset source, UAsset candidate, string re
 
 static bool IsLinearColor(KismetExpression expression, UAsset asset, params float[] expected)
 {
+    return ColorEquals(ReadLinearColor(expression, asset), expected);
+}
+
+static float[] ReadLinearColor(KismetExpression expression, UAsset asset)
+{
     var values = new List<float>();
     Visit(expression, asset, node =>
     {
         if (node is EX_FloatConst value) values.Add(value.Value);
     });
-    return values.Count == expected.Length && values.Zip(expected).All(pair => Math.Abs(pair.First - pair.Second) < 0.0001f);
+    return values.ToArray();
+}
+
+static bool ColorEquals(float[] actual, params float[] expected)
+{
+    return actual.Length == expected.Length &&
+        actual.Zip(expected).All(pair => Math.Abs(pair.First - pair.Second) < 0.0001f);
 }
 
 static void TransplantLegacyExports(
