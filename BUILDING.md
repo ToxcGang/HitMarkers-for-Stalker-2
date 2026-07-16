@@ -36,6 +36,28 @@ Before deriving HitMarkers from the pinned Damage Numbers package, build an unto
 
 This copies the original `ShowDMGStalker2-Windows` trio without converting, patching, repacking, or renaming it. The build verifies byte-for-byte hashes, the original container identity, mount point, package count, and `retoc verify` before creating `dist\ShowDMG-Control.zip`.
 
+To isolate cooked-asset conversion from Blueprint patching, build the conversion control:
+
+```powershell
+.\scripts\package.ps1 `
+    -RetocPath 'C:\Tools\retoc.exe' `
+    -GameRoot 'C:\Program Files (x86)\Steam\steamapps\common\S.T.A.L.K.E.R. 2 Heart of Chornobyl' `
+    -ConversionControl
+```
+
+This performs the same UE5.1 legacy and Zen conversions as HitMarkers without changing any Blueprint. It restores the working reference's IoStore index, requires cooked payloads and parsed asset semantics to survive the round trip, and creates `dist\ShowDMG-ConversionControl.zip` under the original `ShowDMGStalker2-Windows` identity. Serializer-only `.uasset` header normalization is accepted only when names, imports, exports, and every export payload remain identical.
+
+The conversion control is expected to display the original damage numbers in-game. If it mounts but does not run, do not use the reconstructed Zen packages. Build the direct HUD control instead:
+
+```powershell
+.\scripts\package.ps1 `
+    -RetocPath 'C:\Tools\retoc.exe' `
+    -GameRoot 'C:\Program Files (x86)\Steam\steamapps\common\S.T.A.L.K.E.R. 2 Heart of Chornobyl' `
+    -DirectHudControl
+```
+
+This mode keeps the working reference's original Zen package headers and untouched raw chunks. It applies only equal-length export changes, transplants them into the original widget chunk, and creates `dist\HitMarkers-DirectHudControl.zip`. The control uses ShowDMG's proven damage and viewport flow to display a white `X` instead of its numeric value; it does not patch the runner, subsystem, spawner, or damage hooks.
+
 After the control succeeds, build the bootstrap-only diagnostic package with `-BootstrapDiagnostics`. This preserves the working reference's internal container identity, chunk map, perfect-hash lookup, and directory index while adding only runner-startup and HUD-canary diagnostics. It does not enable or bind damage-event hooks.
 
 ## Install

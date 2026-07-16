@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Text.Json;
 using UAssetAPI;
 using UAssetAPI.CustomVersions;
 using UAssetAPI.ExportTypes;
@@ -27,6 +28,64 @@ if (args.Length == 3 && args[0] == "--verify-container-index")
     return 0;
 }
 
+if (args.Length == 3 && args[0] == "--verify-conversion-control")
+{
+    var referenceRoot = Path.GetFullPath(args[1]);
+    var candidateRoot = Path.GetFullPath(args[2]);
+    VerifyConversionControl(referenceRoot, candidateRoot);
+    Console.WriteLine($"Verified semantically equivalent conversion-control assets in {candidateRoot}");
+    return 0;
+}
+
+if (args.Length == 3 && args[0] == "--direct-hud-control")
+{
+    var directSourceRoot = Path.GetFullPath(args[1]);
+    var directOutputRoot = Path.GetFullPath(args[2]);
+    if (!Directory.Exists(directSourceRoot))
+    {
+        throw new DirectoryNotFoundException($"Direct HUD source directory not found: {directSourceRoot}");
+    }
+
+    CopyDirectory(directSourceRoot, directOutputRoot);
+    PatchDirectHudControlWidget(Path.Combine(directOutputRoot, "Stalker2", "Content", "Mods", "ShowDMG",
+        "wbp_ShowDMG.uasset"));
+    VerifyDirectHudControlAssets(directSourceRoot, directOutputRoot);
+    Console.WriteLine($"Patched length-preserving direct HUD control assets in {directOutputRoot}");
+    return 0;
+}
+
+if (args.Length == 3 && args[0] == "--verify-direct-hud-control")
+{
+    var directSourceRoot = Path.GetFullPath(args[1]);
+    var directCandidateRoot = Path.GetFullPath(args[2]);
+    VerifyDirectHudControlAssets(directSourceRoot, directCandidateRoot);
+    Console.WriteLine($"Verified length-preserving direct HUD control assets in {directCandidateRoot}");
+    return 0;
+}
+
+if (args.Length == 5 && args[0] == "--transplant-legacy-exports")
+{
+    var referenceRawRoot = Path.GetFullPath(args[1]);
+    var transplantSourceRoot = Path.GetFullPath(args[2]);
+    var transplantPatchedRoot = Path.GetFullPath(args[3]);
+    var transplantOutputRoot = Path.GetFullPath(args[4]);
+    TransplantLegacyExports(referenceRawRoot, transplantSourceRoot, transplantPatchedRoot, transplantOutputRoot);
+    Console.WriteLine($"Transplanted length-preserving exports into original Zen chunks in {transplantOutputRoot}");
+    return 0;
+}
+
+if (args.Length == 5 && args[0] == "--verify-transplanted-exports")
+{
+    var referenceRawRoot = Path.GetFullPath(args[1]);
+    var transplantSourceRoot = Path.GetFullPath(args[2]);
+    var transplantPatchedRoot = Path.GetFullPath(args[3]);
+    var transplantCandidateRoot = Path.GetFullPath(args[4]);
+    VerifyTransplantedExports(referenceRawRoot, transplantSourceRoot, transplantPatchedRoot,
+        transplantCandidateRoot);
+    Console.WriteLine($"Verified direct Zen export transplant in {transplantCandidateRoot}");
+    return 0;
+}
+
 if (args.Length == 2 && args[0] is "--verify" or "--verify-bootstrap")
 {
     var verificationRoot = Path.GetFullPath(args[1]);
@@ -42,7 +101,7 @@ if (diagnostics || bootstrapDiagnostics) args = args[1..];
 
 if (args.Length != 2)
 {
-    Console.Error.WriteLine("Usage: HitMarkersPatcher [--diagnostics|--bootstrap-diagnostics] <legacy-source> <legacy-output> | --verify|--verify-bootstrap <legacy-root> | --restore-container-index <reference.utoc> <generated.utoc> <output.utoc> | --verify-container-index <reference.utoc> <candidate.utoc>");
+    Console.Error.WriteLine("Usage: HitMarkersPatcher [--diagnostics|--bootstrap-diagnostics] <legacy-source> <legacy-output> | --verify|--verify-bootstrap <legacy-root> | --direct-hud-control <legacy-source> <legacy-output> | --verify-direct-hud-control <legacy-source> <legacy-candidate> | --transplant-legacy-exports <reference-raw> <legacy-source> <legacy-patched> <output-raw> | --verify-transplanted-exports <reference-raw> <legacy-source> <legacy-patched> <candidate-raw> | --restore-container-index <reference.utoc> <generated.utoc> <output.utoc> | --verify-container-index <reference.utoc> <candidate.utoc> | --verify-conversion-control <reference-root> <candidate-root>");
     return 2;
 }
 
@@ -85,6 +144,490 @@ static UAsset LoadAsset(string path)
     }
 
     return new UAsset(path, EngineVersion.VER_UE5_1);
+}
+
+static void VerifyConversionControl(string referenceRoot, string candidateRoot)
+{
+    if (!Directory.Exists(referenceRoot))
+    {
+        throw new DirectoryNotFoundException($"Conversion-control reference directory not found: {referenceRoot}");
+    }
+    if (!Directory.Exists(candidateRoot))
+    {
+        throw new DirectoryNotFoundException($"Conversion-control candidate directory not found: {candidateRoot}");
+    }
+
+    static Dictionary<string, string> EnumerateFiles(string root) => Directory
+        .EnumerateFiles(root, "*", SearchOption.AllDirectories)
+        .ToDictionary(path => Path.GetRelativePath(root, path), path => path, StringComparer.OrdinalIgnoreCase);
+
+    var referenceFiles = EnumerateFiles(referenceRoot);
+    var candidateFiles = EnumerateFiles(candidateRoot);
+    if (referenceFiles.Count != candidateFiles.Count ||
+        !referenceFiles.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase)
+            .SetEquals(candidateFiles.Keys))
+    {
+        throw new InvalidDataException("Conversion-control file set differs after the legacy round trip.");
+    }
+
+    var normalizedHeaders = new List<string>();
+    foreach (var (relativePath, referencePath) in referenceFiles.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+    {
+        var candidatePath = candidateFiles[relativePath];
+        var referenceBytes = File.ReadAllBytes(referencePath);
+        var candidateBytes = File.ReadAllBytes(candidatePath);
+        if (referenceBytes.AsSpan().SequenceEqual(candidateBytes)) continue;
+
+        if (!Path.GetExtension(relativePath).Equals(".uasset", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException($"Conversion control changed cooked payload {relativePath}.");
+        }
+        if (referenceBytes.Length != candidateBytes.Length)
+        {
+            throw new InvalidDataException($"Conversion control changed the size of asset header {relativePath}.");
+        }
+
+        VerifyLegacyAssetSemantics(referencePath, candidatePath, relativePath);
+        normalizedHeaders.Add(relativePath);
+    }
+
+    Console.WriteLine(normalizedHeaders.Count == 0
+        ? "Conversion-control legacy files are byte-identical."
+        : $"Accepted serializer-only header normalization in {normalizedHeaders.Count} asset(s): {string.Join(", ", normalizedHeaders)}");
+}
+
+static void VerifyLegacyAssetSemantics(string referencePath, string candidatePath, string relativePath)
+{
+    var reference = LoadAsset(referencePath);
+    var candidate = LoadAsset(candidatePath);
+
+    RequireEquivalent(reference.GetEngineVersion() == candidate.GetEngineVersion(), "engine version");
+    RequireEquivalent(reference.IsUnversioned == candidate.IsUnversioned, "unversioned flag");
+    RequireEquivalent(reference.UseSeparateBulkDataFiles == candidate.UseSeparateBulkDataFiles,
+        "separate bulk-data flag");
+
+    var referenceNames = reference.GetNameMapIndexList().Select(name => name.Value).ToArray();
+    var candidateNames = candidate.GetNameMapIndexList().Select(name => name.Value).ToArray();
+    RequireEquivalent(referenceNames.SequenceEqual(candidateNames), "name map");
+
+    RequireEquivalent(reference.Imports.Count == candidate.Imports.Count, "import count");
+    for (var index = 0; index < reference.Imports.Count; index++)
+    {
+        var left = reference.Imports[index];
+        var right = candidate.Imports[index];
+        RequireEquivalent(left.ClassPackage.Value.Value == right.ClassPackage.Value.Value &&
+            left.ClassName.Value.Value == right.ClassName.Value.Value &&
+            left.ObjectName.Value.Value == right.ObjectName.Value.Value &&
+            left.OuterIndex.Index == right.OuterIndex.Index,
+            $"import {index}");
+    }
+
+    RequireEquivalent(reference.Exports.Count == candidate.Exports.Count, "export count");
+    for (var index = 0; index < reference.Exports.Count; index++)
+    {
+        var left = reference.Exports[index];
+        var right = candidate.Exports[index];
+        RequireEquivalent(left.GetType() == right.GetType() &&
+            left.ObjectName.Value.Value == right.ObjectName.Value.Value &&
+            left.ClassIndex.Index == right.ClassIndex.Index &&
+            left.SuperIndex.Index == right.SuperIndex.Index &&
+            left.TemplateIndex.Index == right.TemplateIndex.Index &&
+            left.OuterIndex.Index == right.OuterIndex.Index &&
+            left.SerialSize == right.SerialSize,
+            $"export {index} metadata");
+
+        if (left is not RawExport leftRaw || right is not RawExport rightRaw)
+        {
+            throw new InvalidDataException(
+                $"Conversion control changed {relativePath}, whose export {index} is not a verifiable raw export.");
+        }
+        RequireEquivalent(leftRaw.Data.AsSpan().SequenceEqual(rightRaw.Data), $"export {index} payload");
+    }
+
+    void RequireEquivalent(bool condition, string field)
+    {
+        if (!condition)
+        {
+            throw new InvalidDataException($"Conversion control changed {relativePath} {field}.");
+        }
+    }
+}
+
+static void PatchDirectHudControlWidget(string path)
+{
+    var asset = LoadAsset(path);
+    var function = FunctionScript.Parse(asset, "ShowDamage");
+    var functionExport = asset.Exports.OfType<RawExport>()
+        .Single(export => export.ObjectName.Value.Value == "ShowDamage");
+    var originalFunctionLength = functionExport.Data.Length;
+
+    foreach (var offset in new[] { 99, 344, 401 })
+    {
+        SetLinearColor(function.At(offset).Expression, asset, 1f, 1f, 1f, 1f);
+    }
+
+    var allyJump = (EX_Jump)function.At(396).Expression;
+    var enemyJump = (EX_Jump)function.At(453).Expression;
+    function.PendingTargets[allyJump] = "old:245";
+    function.PendingTargets[enemyJump] = "old:245";
+    function.FinalizeScript();
+    if (functionExport.Data.Length != originalFunctionLength)
+    {
+        throw new InvalidDataException("Direct HUD patch changed the ShowDamage export length.");
+    }
+
+    var textBlock = asset.Exports.OfType<RawExport>()
+        .Single(export => export.ObjectName.Value.Value == "TXT_DMG");
+    ReplaceSingle(textBlock.Data, new byte[] { 0x31, 0x30, 0x30, 0x00 }, new byte[] { 0x20, 0x58, 0x20, 0x00 });
+    asset.Write(path);
+}
+
+static void VerifyDirectHudControlAssets(string sourceRoot, string candidateRoot)
+{
+    var patches = CollectLegacyExportPatches(sourceRoot, candidateRoot);
+    var expected = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMG.uasset|ShowDamage",
+        @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMG.uasset|TXT_DMG"
+    };
+    var actual = patches
+        .Select(patch => $"{patch.RelativeAssetPath}|{patch.ExportName}")
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    if (!actual.SetEquals(expected))
+    {
+        throw new InvalidDataException(
+            $"Direct HUD control changed an unexpected export set: {string.Join(", ", actual.Order())}");
+    }
+
+    var widgetPath = Path.Combine(candidateRoot, "Stalker2", "Content", "Mods", "ShowDMG", "wbp_ShowDMG.uasset");
+    var widget = LoadAsset(widgetPath);
+    var function = FunctionScript.Parse(widget, "ShowDamage");
+    Require(function.At(396).Expression is EX_Jump allyJump && allyJump.CodeOffset == 245,
+        "direct HUD control skips Ally numeric text without shifting bytecode");
+    Require(function.At(453).Expression is EX_Jump enemyJump && enemyJump.CodeOffset == 245,
+        "direct HUD control skips Enemy numeric text without shifting bytecode");
+    foreach (var offset in new[] { 99, 344, 401 })
+    {
+        Require(IsLinearColor(function.At(offset).Expression, widget, 1f, 1f, 1f, 1f),
+            $"direct HUD control color at bytecode offset {offset} is opaque white");
+    }
+
+    var textBlock = widget.Exports.OfType<RawExport>()
+        .Single(export => export.ObjectName.Value.Value == "TXT_DMG");
+    Require(textBlock.Data.AsSpan().IndexOf(new byte[] { 0x20, 0x58, 0x20, 0x00 }) >= 0,
+        "direct HUD control marker text exists");
+    Require(textBlock.Data.AsSpan().IndexOf(new byte[] { 0x31, 0x30, 0x30, 0x00 }) < 0,
+        "direct HUD control numeric placeholder was removed");
+}
+
+static List<LegacyExportPatch> CollectLegacyExportPatches(string sourceRoot, string candidateRoot)
+{
+    if (!Directory.Exists(sourceRoot) || !Directory.Exists(candidateRoot))
+    {
+        throw new DirectoryNotFoundException("Legacy source or candidate directory is missing.");
+    }
+
+    var sourceAssets = Directory.EnumerateFiles(sourceRoot, "*.uasset", SearchOption.AllDirectories)
+        .ToDictionary(path => Path.GetRelativePath(sourceRoot, path), path => path, StringComparer.OrdinalIgnoreCase);
+    var candidateAssets = Directory.EnumerateFiles(candidateRoot, "*.uasset", SearchOption.AllDirectories)
+        .ToDictionary(path => Path.GetRelativePath(candidateRoot, path), path => path, StringComparer.OrdinalIgnoreCase);
+    if (sourceAssets.Count != candidateAssets.Count ||
+        !sourceAssets.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(candidateAssets.Keys))
+    {
+        throw new InvalidDataException("Legacy asset set changed during direct HUD patching.");
+    }
+
+    var patches = new List<LegacyExportPatch>();
+    foreach (var (relativePath, sourcePath) in sourceAssets.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+    {
+        var candidatePath = candidateAssets[relativePath];
+        if (new FileInfo(sourcePath).Length != new FileInfo(candidatePath).Length)
+        {
+            throw new InvalidDataException($"Direct HUD patch changed the header length of {relativePath}.");
+        }
+
+        var sourceExportPath = Path.ChangeExtension(sourcePath, ".uexp");
+        var candidateExportPath = Path.ChangeExtension(candidatePath, ".uexp");
+        if (File.Exists(sourceExportPath) != File.Exists(candidateExportPath) ||
+            (File.Exists(sourceExportPath) && new FileInfo(sourceExportPath).Length != new FileInfo(candidateExportPath).Length))
+        {
+            throw new InvalidDataException($"Direct HUD patch changed the export-file length of {relativePath}.");
+        }
+
+        var source = LoadAsset(sourcePath);
+        var candidate = LoadAsset(candidatePath);
+        RequireSameAssetStructure(source, candidate, relativePath);
+        for (var index = 0; index < source.Exports.Count; index++)
+        {
+            if (source.Exports[index] is not RawExport sourceExport ||
+                candidate.Exports[index] is not RawExport candidateExport)
+            {
+                throw new InvalidDataException($"Direct HUD asset {relativePath} export {index} is not raw.");
+            }
+            if (sourceExport.Data.Length != candidateExport.Data.Length)
+            {
+                throw new InvalidDataException($"Direct HUD patch changed {relativePath} export {index} length.");
+            }
+            if (!sourceExport.Data.AsSpan().SequenceEqual(candidateExport.Data))
+            {
+                patches.Add(new LegacyExportPatch(relativePath, sourceExport.ObjectName.Value.Value,
+                    sourceExport.Data.ToArray(), candidateExport.Data.ToArray()));
+            }
+        }
+    }
+
+    return patches;
+}
+
+static void RequireSameAssetStructure(UAsset source, UAsset candidate, string relativePath)
+{
+    void Same(bool condition, string field)
+    {
+        if (!condition) throw new InvalidDataException($"Direct HUD patch changed {relativePath} {field}.");
+    }
+
+    Same(source.GetEngineVersion() == candidate.GetEngineVersion(), "engine version");
+    Same(source.IsUnversioned == candidate.IsUnversioned, "unversioned flag");
+    Same(source.UseSeparateBulkDataFiles == candidate.UseSeparateBulkDataFiles, "bulk-data flag");
+    Same(source.GetNameMapIndexList().Select(name => name.Value)
+        .SequenceEqual(candidate.GetNameMapIndexList().Select(name => name.Value)), "name map");
+    Same(source.Imports.Count == candidate.Imports.Count, "import count");
+    for (var index = 0; index < source.Imports.Count; index++)
+    {
+        var left = source.Imports[index];
+        var right = candidate.Imports[index];
+        Same(left.ClassPackage.Value.Value == right.ClassPackage.Value.Value &&
+            left.ClassName.Value.Value == right.ClassName.Value.Value &&
+            left.ObjectName.Value.Value == right.ObjectName.Value.Value &&
+            left.OuterIndex.Index == right.OuterIndex.Index,
+            $"import {index}");
+    }
+
+    Same(source.Exports.Count == candidate.Exports.Count, "export count");
+    for (var index = 0; index < source.Exports.Count; index++)
+    {
+        var left = source.Exports[index];
+        var right = candidate.Exports[index];
+        Same(left.GetType() == right.GetType() &&
+            left.ObjectName.Value.Value == right.ObjectName.Value.Value &&
+            left.ClassIndex.Index == right.ClassIndex.Index &&
+            left.SuperIndex.Index == right.SuperIndex.Index &&
+            left.TemplateIndex.Index == right.TemplateIndex.Index &&
+            left.OuterIndex.Index == right.OuterIndex.Index &&
+            left.SerialSize == right.SerialSize,
+            $"export {index} metadata");
+    }
+}
+
+static bool IsLinearColor(KismetExpression expression, UAsset asset, params float[] expected)
+{
+    var values = new List<float>();
+    Visit(expression, asset, node =>
+    {
+        if (node is EX_FloatConst value) values.Add(value.Value);
+    });
+    return values.Count == expected.Length && values.Zip(expected).All(pair => Math.Abs(pair.First - pair.Second) < 0.0001f);
+}
+
+static void TransplantLegacyExports(
+    string referenceRawRoot,
+    string sourceRoot,
+    string patchedRoot,
+    string outputRawRoot)
+{
+    if (!Directory.Exists(referenceRawRoot))
+    {
+        throw new DirectoryNotFoundException($"Reference raw container directory not found: {referenceRawRoot}");
+    }
+    if (Path.GetFullPath(referenceRawRoot).Equals(Path.GetFullPath(outputRawRoot),
+        StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException("Direct Zen transplant requires a distinct output directory.");
+    }
+
+    CopyDirectory(referenceRawRoot, outputRawRoot);
+    var expectedChunks = BuildTransplantedChunks(referenceRawRoot, sourceRoot, patchedRoot);
+    var outputChunkRoot = Path.Combine(outputRawRoot, "chunks");
+    foreach (var (chunkId, bytes) in expectedChunks)
+    {
+        var outputChunk = Path.Combine(outputChunkRoot, chunkId);
+        if (!File.Exists(outputChunk))
+        {
+            throw new FileNotFoundException("Output raw chunk is missing.", outputChunk);
+        }
+        File.WriteAllBytes(outputChunk, bytes);
+    }
+
+    VerifyTransplantedExports(referenceRawRoot, sourceRoot, patchedRoot, outputRawRoot);
+}
+
+static void VerifyTransplantedExports(
+    string referenceRawRoot,
+    string sourceRoot,
+    string patchedRoot,
+    string candidateRawRoot)
+{
+    if (!Directory.Exists(referenceRawRoot) || !Directory.Exists(candidateRawRoot))
+    {
+        throw new DirectoryNotFoundException("Reference or candidate raw container directory is missing.");
+    }
+
+    var expectedChunks = BuildTransplantedChunks(referenceRawRoot, sourceRoot, patchedRoot);
+    if (expectedChunks.Count == 0)
+    {
+        throw new InvalidDataException("Direct Zen transplant has no changed chunks.");
+    }
+
+    static Dictionary<string, string> FilesByRelativePath(string root) => Directory
+        .EnumerateFiles(root, "*", SearchOption.AllDirectories)
+        .ToDictionary(path => Path.GetRelativePath(root, path), path => path, StringComparer.OrdinalIgnoreCase);
+
+    var referenceFiles = FilesByRelativePath(referenceRawRoot);
+    var candidateFiles = FilesByRelativePath(candidateRawRoot);
+    if (referenceFiles.Count != candidateFiles.Count ||
+        !referenceFiles.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(candidateFiles.Keys))
+    {
+        throw new InvalidDataException("Direct Zen transplant changed the raw container file set.");
+    }
+
+    foreach (var (relativePath, referencePath) in referenceFiles)
+    {
+        var candidatePath = candidateFiles[relativePath];
+        if (relativePath.Equals("manifest.json", StringComparison.OrdinalIgnoreCase))
+        {
+            RequireEquivalentRawManifests(referencePath, candidatePath);
+            continue;
+        }
+        var expected = relativePath.StartsWith($"chunks{Path.DirectorySeparatorChar}",
+                StringComparison.OrdinalIgnoreCase) &&
+            expectedChunks.TryGetValue(Path.GetFileName(relativePath), out var changedChunk)
+                ? changedChunk
+                : File.ReadAllBytes(referencePath);
+        var candidate = File.ReadAllBytes(candidatePath);
+        if (!expected.AsSpan().SequenceEqual(candidate))
+        {
+            throw new InvalidDataException($"Direct Zen transplant produced unexpected bytes in {relativePath}.");
+        }
+    }
+
+    Console.WriteLine($"Direct Zen transplant changed exactly {expectedChunks.Count} raw chunk(s): " +
+        string.Join(", ", expectedChunks.Keys.Order(StringComparer.Ordinal)));
+}
+
+static void RequireEquivalentRawManifests(string referencePath, string candidatePath)
+{
+    static (string Version, string MountPoint, Dictionary<string, string> Chunks) Read(string path)
+    {
+        using var document = JsonDocument.Parse(File.ReadAllBytes(path));
+        var root = document.RootElement;
+        var chunks = root.GetProperty("chunk_paths").EnumerateObject()
+            .ToDictionary(property => property.Name,
+                property => property.Value.GetString() ?? string.Empty,
+                StringComparer.OrdinalIgnoreCase);
+        return (
+            root.GetProperty("version").GetString() ?? string.Empty,
+            root.GetProperty("mount_point").GetString() ?? string.Empty,
+            chunks);
+    }
+
+    var reference = Read(referencePath);
+    var candidate = Read(candidatePath);
+    if (reference.Version != candidate.Version || reference.MountPoint != candidate.MountPoint ||
+        reference.Chunks.Count != candidate.Chunks.Count ||
+        reference.Chunks.Any(pair => !candidate.Chunks.TryGetValue(pair.Key, out var value) || value != pair.Value))
+    {
+        throw new InvalidDataException("Direct Zen transplant changed raw manifest semantics.");
+    }
+}
+
+static Dictionary<string, byte[]> BuildTransplantedChunks(
+    string referenceRawRoot,
+    string sourceRoot,
+    string patchedRoot)
+{
+    var exportPatches = CollectLegacyExportPatches(sourceRoot, patchedRoot);
+    if (exportPatches.Count == 0)
+    {
+        throw new InvalidDataException("No changed legacy exports were supplied for direct Zen transplant.");
+    }
+
+    var manifestPath = Path.Combine(referenceRawRoot, "manifest.json");
+    if (!File.Exists(manifestPath))
+    {
+        throw new FileNotFoundException("Reference raw manifest is missing.", manifestPath);
+    }
+
+    using var document = JsonDocument.Parse(File.ReadAllBytes(manifestPath));
+    var chunkPaths = document.RootElement.GetProperty("chunk_paths")
+        .EnumerateObject()
+        .ToDictionary(
+            property => NormalizeCookedPath(property.Value.GetString()
+                ?? throw new InvalidDataException("Raw manifest contains a null chunk path.")),
+            property => property.Name,
+            StringComparer.OrdinalIgnoreCase);
+
+    var chunks = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+    var occupiedRanges = new Dictionary<string, List<(int Start, int End)>>(StringComparer.OrdinalIgnoreCase);
+    foreach (var patch in exportPatches)
+    {
+        var cookedPath = NormalizeCookedPath(patch.RelativeAssetPath);
+        if (!chunkPaths.TryGetValue(cookedPath, out var chunkId))
+        {
+            throw new InvalidDataException($"Raw manifest has no package chunk for {patch.RelativeAssetPath}.");
+        }
+
+        if (!chunks.TryGetValue(chunkId, out var chunk))
+        {
+            var chunkPath = Path.Combine(referenceRawRoot, "chunks", chunkId);
+            if (!File.Exists(chunkPath)) throw new FileNotFoundException("Reference raw chunk is missing.", chunkPath);
+            chunk = File.ReadAllBytes(chunkPath);
+            chunks.Add(chunkId, chunk);
+            occupiedRanges.Add(chunkId, new List<(int Start, int End)>());
+        }
+
+        if (patch.SourceData.Length != patch.PatchedData.Length || patch.SourceData.Length == 0)
+        {
+            throw new InvalidDataException(
+                $"Export {patch.RelativeAssetPath}:{patch.ExportName} is not length-preserving.");
+        }
+
+        var offset = FindUniqueSequence(chunk, patch.SourceData,
+            $"{patch.RelativeAssetPath}:{patch.ExportName}");
+        var end = checked(offset + patch.SourceData.Length);
+        if (occupiedRanges[chunkId].Any(range => offset < range.End && end > range.Start))
+        {
+            throw new InvalidDataException($"Direct Zen export patches overlap in chunk {chunkId}.");
+        }
+
+        patch.PatchedData.CopyTo(chunk, offset);
+        occupiedRanges[chunkId].Add((offset, end));
+        Console.WriteLine($"Mapped {patch.RelativeAssetPath}:{patch.ExportName} to chunk {chunkId} at 0x{offset:X}.");
+    }
+
+    return chunks;
+}
+
+static int FindUniqueSequence(byte[] haystack, byte[] needle, string description)
+{
+    var first = haystack.AsSpan().IndexOf(needle);
+    if (first < 0)
+    {
+        throw new InvalidDataException($"Original Zen chunk does not contain export {description}.");
+    }
+
+    var remainder = haystack.AsSpan(first + 1);
+    if (remainder.IndexOf(needle) >= 0)
+    {
+        throw new InvalidDataException($"Original Zen chunk contains export {description} more than once.");
+    }
+    return first;
+}
+
+static string NormalizeCookedPath(string path)
+{
+    var normalized = path.Replace('\\', '/');
+    while (normalized.StartsWith("../", StringComparison.Ordinal)) normalized = normalized[3..];
+    return normalized.TrimStart('/');
 }
 
 static void PatchDamageWidget(string path)
@@ -1373,6 +1916,12 @@ static byte[] SerializeName(UAsset asset, string value)
     writer.Write(new FName(asset, value));
     return stream.ToArray();
 }
+
+sealed record LegacyExportPatch(
+    string RelativeAssetPath,
+    string ExportName,
+    byte[] SourceData,
+    byte[] PatchedData);
 
 sealed class ScriptStatement
 {
