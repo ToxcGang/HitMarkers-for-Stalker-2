@@ -3,7 +3,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$GameRoot,
 
-    [string]$PackagePath = (Join-Path $PSScriptRoot '..\dist')
+    [string]$PackagePath = (Join-Path $PSScriptRoot '..\dist'),
+
+    [switch]$ExclusiveHitMarkersTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +43,18 @@ $packageFiles = foreach ($extension in '.pak', '.ucas', '.utoc') {
 
 $modsDir = Join-Path $paksDir '~mods'
 New-Item -ItemType Directory -Force -Path $modsDir | Out-Null
+
+if ($ExclusiveHitMarkersTest) {
+    foreach ($knownName in 'HitMarkersStalker2-Windows', 'ShowDMGStalker2-Windows') {
+        foreach ($extension in '.pak', '.ucas', '.utoc') {
+            $knownFile = Join-Path $modsDir "$knownName$extension"
+            if (Test-Path -LiteralPath $knownFile -PathType Leaf) {
+                Remove-Item -LiteralPath $knownFile -Force
+                Write-Host "Removed test-conflicting package $knownFile"
+            }
+        }
+    }
+}
 
 foreach ($file in $packageFiles) {
     $destination = Join-Path $modsDir $file.Name

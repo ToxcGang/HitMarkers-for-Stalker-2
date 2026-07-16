@@ -16,6 +16,10 @@ param(
 
     [string]$PackageName = 'HitMarkersStalker2-Windows',
 
+    [switch]$ReferenceControl,
+
+    [switch]$BootstrapDiagnostics,
+
     [switch]$Diagnostics
 )
 
@@ -24,6 +28,10 @@ Set-StrictMode -Version Latest
 
 $referenceUrl = 'https://g-5761.modapi.io/v1/games/5761/mods/5256912/files/6800765/download'
 $referenceSha256 = 'F5D37FD3D55BC3B79CB5BA564C9ABF7A3365647D40675D6F6985B624C800C82B'
+
+if (@($ReferenceControl, $BootstrapDiagnostics, $Diagnostics).Where({ $_ }).Count -gt 1) {
+    throw 'ReferenceControl, BootstrapDiagnostics, and Diagnostics are mutually exclusive.'
+}
 
 function Resolve-RequiredFile {
     param(
@@ -64,6 +72,32 @@ function Invoke-Checked {
     }
 }
 
+function Assert-RawManifestEquivalent {
+    param(
+        [Parameter(Mandatory = $true)][string]$ReferenceManifest,
+        [Parameter(Mandatory = $true)][string]$CandidateManifest,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $reference = Get-Content -LiteralPath $ReferenceManifest -Raw | ConvertFrom-Json
+    $candidate = Get-Content -LiteralPath $CandidateManifest -Raw | ConvertFrom-Json
+    if ($candidate.version -ne $reference.version) {
+        throw "$Description TOC version differs from the working reference."
+    }
+
+    $referenceChunks = @($reference.chunk_paths.psobject.Properties)
+    $candidateChunks = @($candidate.chunk_paths.psobject.Properties)
+    if ($candidateChunks.Count -ne $referenceChunks.Count) {
+        throw "$Description chunk count differs from the working reference."
+    }
+    foreach ($chunk in $referenceChunks) {
+        $candidateChunk = $candidate.chunk_paths.psobject.Properties[$chunk.Name]
+        if (-not $candidateChunk -or $candidateChunk.Value -ne $chunk.Value) {
+            throw "$Description changed chunk $($chunk.Name) ($($chunk.Value))."
+        }
+    }
+}
+
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $resolvedRetoc = Resolve-RequiredFile -Path $RetocPath -Name 'retoc.exe'
 $resolvedGameRoot = Resolve-RequiredDirectory -Path $GameRoot -Name 'S.T.A.L.K.E.R. 2 game root'
@@ -91,7 +125,13 @@ $legacyDir = Join-Path $resolvedWorkDir 'legacy-source'
 $patchedDir = Join-Path $resolvedWorkDir 'legacy-patched'
 $zenDir = Join-Path $resolvedWorkDir 'zen-unmounted'
 $rawDir = Join-Path $resolvedWorkDir 'raw-mounted'
-New-Item -ItemType Directory -Force -Path $referenceDir, $combinedDir, $legacyDir, $patchedDir, $zenDir, $resolvedOutputDir | Out-Null
+$referenceRawDir = Join-Path $resolvedWorkDir 'reference-raw'
+$packedDir = Join-Path $resolvedWorkDir 'packed-container'
+$internalDir = Join-Path $resolvedWorkDir 'internal-container'
+$roundTripRawDir = Join-Path $resolvedWorkDir 'roundtrip-raw'
+$legacyRoundTripDir = Join-Path $resolvedWorkDir 'legacy-roundtrip'
+New-Item -ItemType Directory -Force -Path $referenceDir, $combinedDir, $legacyDir, $patchedDir, $zenDir, `
+    $packedDir, $internalDir, $legacyRoundTripDir, $resolvedOutputDir | Out-Null
 
 if ($ReferenceArchive) {
     $resolvedArchive = Resolve-RequiredFile -Path $ReferenceArchive -Name 'Damage Numbers 2.0 reference archive'
@@ -115,6 +155,50 @@ if (-not $referenceUtoc) {
 $referenceBase = Join-Path $referenceUtoc.DirectoryName 'ShowDMGStalker2-Windows'
 foreach ($extension in '.pak', '.ucas', '.utoc') {
     Resolve-RequiredFile -Path "$referenceBase$extension" -Name "Damage Numbers $extension file" | Out-Null
+}
+
+if ($ReferenceControl) {
+    $controlName = 'ShowDMGStalker2-Windows'
+    $controlFiles = foreach ($extension in '.pak', '.ucas', '.utoc') {
+        $source = Resolve-RequiredFile -Path "$referenceBase$extension" -Name "Damage Numbers control $extension file"
+        $destination = Join-Path $resolvedOutputDir "$controlName$extension"
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+
+        $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+        $outputHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+        if ($sourceHash -ne $outputHash) {
+            throw "Reference control hash mismatch after copying $extension."
+        }
+
+        Get-Item -LiteralPath $destination
+    }
+
+    $controlUtoc = Join-Path $resolvedOutputDir "$controlName.utoc"
+    Invoke-Checked -Executable $resolvedRetoc -Description 'Untouched Damage Numbers control verification' -Arguments @(
+        'verify', $controlUtoc
+    )
+
+    $controlInfo = (& $resolvedRetoc 'info' $controlUtoc | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Damage Numbers control inspection failed with exit code $LASTEXITCODE."
+    }
+    if ($controlInfo -notmatch '(?m)^ShowDMGStalker2-Windows\s*$') {
+        throw "Damage Numbers control identity postcondition failed.`n$controlInfo"
+    }
+    if ($controlInfo -notmatch [regex]::Escape('mount_point: ../../../Stalker2/Content/')) {
+        throw "Damage Numbers control mount point postcondition failed.`n$controlInfo"
+    }
+    if ($controlInfo -notmatch 'packages:\s+7') {
+        throw "Damage Numbers control package count postcondition failed.`n$controlInfo"
+    }
+
+    $controlZip = Join-Path $resolvedOutputDir 'ShowDMG-Control.zip'
+    if (Test-Path -LiteralPath $controlZip) {
+        Remove-Item -LiteralPath $controlZip -Force
+    }
+    Compress-Archive -LiteralPath $controlFiles.FullName -DestinationPath $controlZip -CompressionLevel Optimal
+    Write-Host "Created byte-identical reference control $controlZip"
+    return
 }
 
 Get-ChildItem -LiteralPath $paksDir -File -Filter '*.utoc' |
@@ -157,15 +241,31 @@ if ([System.IO.Path]::GetExtension($resolvedPatcher) -ne '.exe') {
 }
 $patcherArguments = @($legacyDir, $patchedDir)
 if ($Diagnostics) { $patcherArguments = @('--diagnostics', $legacyDir, $patchedDir) }
+if ($BootstrapDiagnostics) { $patcherArguments = @('--bootstrap-diagnostics', $legacyDir, $patchedDir) }
 Invoke-Checked -Executable $resolvedPatcher -Description 'HitMarkers cooked Blueprint patch' -Arguments @(
     $patcherArguments
 )
+$verifyMode = if ($BootstrapDiagnostics) { '--verify-bootstrap' } else { '--verify' }
 Invoke-Checked -Executable $resolvedPatcher -Description 'Independent cooked Blueprint verification' -Arguments @(
-    '--verify', $patchedDir
+    $verifyMode, $patchedDir
 )
+foreach ($relativePath in @(
+    'Stalker2\Content\bp_mwss_ShowDMG.uasset',
+    'Stalker2\Content\Autogenerated_1758836765_WorldSubsystemData.uasset'
+)) {
+    $sourceSubsystem = Resolve-RequiredFile -Path (Join-Path $legacyDir $relativePath) -Name "Source bootstrap asset $relativePath"
+    $patchedSubsystem = Resolve-RequiredFile -Path (Join-Path $patchedDir $relativePath) -Name "Patched bootstrap asset $relativePath"
+    if ((Get-FileHash -LiteralPath $sourceSubsystem -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $patchedSubsystem -Algorithm SHA256).Hash) {
+        throw "Bootstrap registration asset was unexpectedly modified: $relativePath"
+    }
+}
 
 $outputUtoc = Join-Path $resolvedOutputDir "$PackageName.utoc"
-$unmountedUtoc = Join-Path $zenDir "$PackageName.utoc"
+$internalName = 'ShowDMGStalker2-Windows'
+$unmountedUtoc = Join-Path $zenDir "$internalName.utoc"
+$packedUtoc = Join-Path $packedDir "$internalName.utoc"
+$internalUtoc = Join-Path $internalDir "$internalName.utoc"
 foreach ($extension in '.pak', '.ucas', '.utoc') {
     $stalePackage = Join-Path $resolvedOutputDir "$PackageName$extension"
     if (Test-Path -LiteralPath $stalePackage) {
@@ -178,31 +278,76 @@ Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers IoStore packa
 Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers raw container extraction' -Arguments @(
     'unpack-raw', $unmountedUtoc, $rawDir
 )
-
-$manifestPath = Resolve-RequiredFile -Path (Join-Path $rawDir 'manifest.json') -Name 'Raw container manifest'
-$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-$manifest.mount_point = '../../../Stalker2/Content/'
-$manifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+Invoke-Checked -Executable $resolvedRetoc -Description 'Working reference raw container extraction' -Arguments @(
+    'unpack-raw', $referenceUtoc.FullName, $referenceRawDir
+)
+$referenceManifest = Resolve-RequiredFile -Path (Join-Path $referenceRawDir 'manifest.json') -Name 'Reference raw manifest'
+$manifestPath = Resolve-RequiredFile -Path (Join-Path $rawDir 'manifest.json') -Name 'Generated raw manifest'
+Assert-RawManifestEquivalent -ReferenceManifest $referenceManifest -CandidateManifest $manifestPath `
+    -Description 'Generated HitMarkers manifest'
 
 Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers mounted container packaging' -Arguments @(
-    'pack-raw', $rawDir, $outputUtoc
+    'pack-raw', $rawDir, $packedUtoc
 )
-Copy-Item -LiteralPath (Resolve-RequiredFile -Path "$referenceBase.pak" -Name 'Reference companion .pak') `
-    -Destination (Join-Path $resolvedOutputDir "$PackageName.pak") -Force
+Invoke-Checked -Executable $resolvedPatcher -Description 'HitMarkers reference IoStore index restoration' -Arguments @(
+    '--restore-container-index', $referenceUtoc.FullName, $packedUtoc, $internalUtoc
+)
+Invoke-Checked -Executable $resolvedPatcher -Description 'Independent HitMarkers IoStore index verification' -Arguments @(
+    '--verify-container-index', $referenceUtoc.FullName, $internalUtoc
+)
+$internalBase = Join-Path $internalDir $internalName
+$packedBase = Join-Path $packedDir $internalName
+Copy-Item -LiteralPath (Resolve-RequiredFile -Path "$packedBase.ucas" -Name 'Packed HitMarkers .ucas') -Destination "$internalBase.ucas" -Force
+Copy-Item -LiteralPath (Resolve-RequiredFile -Path "$referenceBase.pak" -Name 'Reference companion .pak') -Destination "$internalBase.pak" -Force
+foreach ($extension in '.pak', '.ucas', '.utoc') {
+    Copy-Item -LiteralPath (Resolve-RequiredFile -Path "$internalBase$extension" -Name "Internal $extension package") `
+        -Destination (Join-Path $resolvedOutputDir "$PackageName$extension") -Force
+}
 Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers package verification' -Arguments @(
     'verify', $outputUtoc
 )
+Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers raw round-trip extraction' -Arguments @(
+    'unpack-raw', $outputUtoc, $roundTripRawDir
+)
+$roundTripManifest = Resolve-RequiredFile -Path (Join-Path $roundTripRawDir 'manifest.json') -Name 'Round-trip raw manifest'
+Assert-RawManifestEquivalent -ReferenceManifest $referenceManifest -CandidateManifest $roundTripManifest `
+    -Description 'Round-trip HitMarkers manifest'
 
 $containerInfo = (& $resolvedRetoc 'info' $outputUtoc | Out-String)
 if ($LASTEXITCODE -ne 0) {
     throw "HitMarkers container inspection failed with exit code $LASTEXITCODE."
 }
-if ($containerInfo -notmatch [regex]::Escape('mount_point: ../../../Stalker2/Content/')) {
+$internalInfo = (& $resolvedRetoc 'info' $internalUtoc | Out-String)
+if ($LASTEXITCODE -ne 0 -or $internalInfo -notmatch '(?m)^ShowDMGStalker2-Windows\s*$') {
+    throw "HitMarkers internal build identity postcondition failed.`n$internalInfo"
+}
+if ($containerInfo -notmatch [regex]::Escape('mount_point: ../../../Stalker2/Content/') -or
+    $internalInfo -notmatch [regex]::Escape('mount_point: ../../../Stalker2/Content/')) {
     throw "HitMarkers mount point postcondition failed.`n$containerInfo"
 }
-if ($containerInfo -notmatch 'packages:\s+7') {
+if ($containerInfo -notmatch 'chunks:\s+8' -or $containerInfo -notmatch 'packages:\s+7') {
     throw "HitMarkers cooked package count postcondition failed.`n$containerInfo"
 }
+foreach ($extension in '.pak', '.ucas', '.utoc') {
+    $internalHash = (Get-FileHash -LiteralPath "$internalBase$extension" -Algorithm SHA256).Hash
+    $externalHash = (Get-FileHash -LiteralPath (Join-Path $resolvedOutputDir "$PackageName$extension") -Algorithm SHA256).Hash
+    if ($internalHash -ne $externalHash) {
+        throw "External $PackageName$extension differs from the internally identified ShowDMG container."
+    }
+}
+
+foreach ($extension in '.pak', '.ucas', '.utoc') {
+    Copy-Item -LiteralPath "$internalBase$extension" -Destination $combinedDir -Force
+}
+Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers legacy round-trip conversion' -Arguments @(
+    'to-legacy', $combinedDir, $legacyRoundTripDir, '--filter', 'ShowDMG', '--version', 'UE5_1'
+)
+Invoke-Checked -Executable $resolvedRetoc -Description 'HitMarkers world subsystem legacy round-trip conversion' -Arguments @(
+    'to-legacy', $combinedDir, $legacyRoundTripDir, '--filter', 'Autogenerated_1758836765_WorldSubsystemData', '--version', 'UE5_1'
+)
+Invoke-Checked -Executable $resolvedPatcher -Description 'Legacy round-trip cooked Blueprint verification' -Arguments @(
+    $verifyMode, $legacyRoundTripDir
+)
 
 $packageFiles = foreach ($extension in '.pak', '.ucas', '.utoc') {
     Resolve-RequiredFile -Path (Join-Path $resolvedOutputDir "$PackageName$extension") -Name "Built $extension package"

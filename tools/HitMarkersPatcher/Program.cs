@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using UAssetAPI;
 using UAssetAPI.CustomVersions;
 using UAssetAPI.ExportTypes;
@@ -7,20 +8,41 @@ using UAssetAPI.Kismet.Bytecode.Expressions;
 using UAssetAPI.UnrealTypes;
 using UAssetAPI.Unversioned;
 
-if (args.Length == 2 && args[0] == "--verify")
+if (args.Length == 4 && args[0] == "--restore-container-index")
+{
+    var referenceUtoc = Path.GetFullPath(args[1]);
+    var generatedUtoc = Path.GetFullPath(args[2]);
+    var outputUtoc = Path.GetFullPath(args[3]);
+    IoStoreToc.RestoreReferenceIndex(referenceUtoc, generatedUtoc, outputUtoc);
+    Console.WriteLine($"Restored reference IoStore index in {outputUtoc}");
+    return 0;
+}
+
+if (args.Length == 3 && args[0] == "--verify-container-index")
+{
+    var referenceUtoc = Path.GetFullPath(args[1]);
+    var candidateUtoc = Path.GetFullPath(args[2]);
+    IoStoreToc.VerifyReferenceIndex(referenceUtoc, candidateUtoc);
+    Console.WriteLine($"Verified reference IoStore index in {candidateUtoc}");
+    return 0;
+}
+
+if (args.Length == 2 && args[0] is "--verify" or "--verify-bootstrap")
 {
     var verificationRoot = Path.GetFullPath(args[1]);
-    VerifyPatchedAssets(verificationRoot);
+    if (args[0] == "--verify-bootstrap") VerifyBootstrapAssets(verificationRoot);
+    else VerifyPatchedAssets(verificationRoot);
     Console.WriteLine($"Verified HitMarkers cooked assets in {verificationRoot}");
     return 0;
 }
 
 var diagnostics = args.Length == 3 && args[0] == "--diagnostics";
-if (diagnostics) args = args[1..];
+var bootstrapDiagnostics = args.Length == 3 && args[0] == "--bootstrap-diagnostics";
+if (diagnostics || bootstrapDiagnostics) args = args[1..];
 
 if (args.Length != 2)
 {
-    Console.Error.WriteLine("Usage: HitMarkersPatcher [--diagnostics] <legacy-source> <legacy-output> | --verify <legacy-root>");
+    Console.Error.WriteLine("Usage: HitMarkersPatcher [--diagnostics|--bootstrap-diagnostics] <legacy-source> <legacy-output> | --verify|--verify-bootstrap <legacy-root> | --restore-container-index <reference.utoc> <generated.utoc> <output.utoc> | --verify-container-index <reference.utoc> <candidate.utoc>");
     return 2;
 }
 
@@ -37,10 +59,20 @@ CopyDirectory(sourceRoot, outputRoot);
 
 PatchDamageWidget(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "wbp_ShowDMG.uasset"));
 PatchDamageArea(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "wbp_ShowDMGArea.uasset"));
-PatchHolder(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "bp_dmgActorHolder.uasset"), diagnostics);
-PatchSpawner(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "bpac_dmgWidgetSpawner.uasset"), diagnostics);
-PatchRunner(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "BP_Run_ModActor.uasset"), diagnostics);
-VerifyPatchedAssets(outputRoot);
+PatchHolder(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "bp_dmgActorHolder.uasset"),
+    diagnostics || bootstrapDiagnostics);
+PatchSpawnerDisplay(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "bpac_dmgWidgetSpawner.uasset"));
+if (bootstrapDiagnostics)
+{
+    PatchBootstrapRunner(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "BP_Run_ModActor.uasset"));
+    VerifyBootstrapAssets(outputRoot);
+}
+else
+{
+    PatchSpawner(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "bpac_dmgWidgetSpawner.uasset"), diagnostics);
+    PatchRunner(Path.Combine(outputRoot, "Stalker2", "Content", "Mods", "ShowDMG", "BP_Run_ModActor.uasset"), diagnostics);
+    VerifyPatchedAssets(outputRoot);
+}
 
 Console.WriteLine($"Patched HitMarkers assets in {outputRoot}");
 return 0;
@@ -146,6 +178,8 @@ static void PatchDamageArea(string path)
 static void PatchHolder(string path, bool diagnostics)
 {
     var asset = LoadAsset(path);
+    var beginPlayTarget = ReadEntrypoint(asset, "ReceiveBeginPlay");
+    var tickTarget = ReadEntrypoint(asset, "ReceiveTick");
     var graph = FunctionScript.Parse(asset, "ExecuteUbergraph_bp_dmgActorHolder");
     var gameplayStatics = EnsureClass(asset, "/Script/Engine", "GameplayStatics");
     var getPlayerController = EnsureObject(asset, gameplayStatics, "GetPlayerController");
@@ -210,7 +244,7 @@ static void PatchHolder(string path, bool diagnostics)
     if (diagnostics)
     {
         graph.InsertBefore(cleanupDelay, new ScriptStatement(null, "widget_diagnostic",
-            PrintLog(asset, "[HitMarkers][Diagnostic] widget created, inserted, visible, fade started")));
+            PrintLog(asset, "[HitMarkers][Diagnostic] widget created; viewport inserted; visible; fade started")));
     }
     graph.At(81).Expression = new EX_Nothing();
 
@@ -238,16 +272,42 @@ static void PatchHolder(string path, bool diagnostics)
         }
     };
     graph.InsertBefore(destroy, new ScriptStatement(15, "remove_area", removeContext));
+    if (diagnostics)
+    {
+        graph.InsertBefore(destroy, new ScriptStatement(null, "fade_diagnostic",
+            PrintLog(asset, "[HitMarkers][Diagnostic] fade completed; widget removed")));
+    }
 
     var holderMap = graph.FinalizeScript();
-    UpdateEntrypoint(asset, "ReceiveBeginPlay", 215, holderMap[215]);
-    UpdateEntrypoint(asset, "ReceiveTick", 612, holderMap[732]);
+    var disabledTick = graph.Statements.Last(statement => statement.Expression is EX_Return).OriginalOffset
+        ?? throw new InvalidDataException("Holder terminal return has no original offset.");
+    UpdateEntrypoint(asset, "ReceiveBeginPlay", beginPlayTarget, holderMap[beginPlayTarget]);
+    UpdateEntrypoint(asset, "ReceiveTick", tickTarget, holderMap[disabledTick]);
+    asset.Write(path);
+}
+
+static void PatchSpawnerDisplay(string path)
+{
+    var asset = LoadAsset(path);
+    var showDamage = FunctionScript.Parse(asset, "showDamage");
+    var damageAssignment = showDamage.At(354);
+    var typeAssignment = showDamage.At(403);
+    showDamage.Statements.Remove(damageAssignment);
+    showDamage.Statements.Remove(typeAssignment);
+    var finish = showDamage.At(316);
+    var deferredOwner = Local(asset, "CallFunc_BeginDeferredActorSpawnFromClass_ReturnValue", showDamage.ExportIndex);
+    ((EX_Context)((EX_Let)damageAssignment.Expression).Variable).ObjectExpression = deferredOwner;
+    ((EX_Context)((EX_Let)typeAssignment.Expression).Variable).ObjectExpression = deferredOwner;
+    showDamage.InsertBefore(finish, damageAssignment);
+    showDamage.InsertBefore(finish, typeAssignment);
+    showDamage.FinalizeScript();
     asset.Write(path);
 }
 
 static void PatchSpawner(string path, bool diagnostics)
 {
     var asset = LoadAsset(path);
+    var tickTarget = ReadEntrypoint(asset, "ReceiveTick");
     var graph = FunctionScript.Parse(asset, "ExecuteUbergraph_bpac_dmgWidgetSpawner");
 
     var stalkerPackage = EnsurePackage(asset, "/Script/Stalker2");
@@ -478,7 +538,7 @@ static void PatchSpawner(string path, bool diagnostics)
     }
 
     var spawnerMap = graph.FinalizeScript();
-    UpdateEntrypoint(asset, "ReceiveTick", 454, spawnerMap[454]);
+    UpdateEntrypoint(asset, "ReceiveTick", tickTarget, spawnerMap[tickTarget]);
 
     var handler = FunctionScript.Parse(asset, "setAgentOwner");
     var oldHandlerName = SerializeName(asset, "setAgentOwner");
@@ -512,24 +572,126 @@ static void PatchSpawner(string path, bool diagnostics)
     handler.Statements.Add(new ScriptStatement(null, "handler_end", new EX_EndOfScript()));
     handler.Rebuild();
 
-    var showDamage = FunctionScript.Parse(asset, "showDamage");
-    var damageAssignment = showDamage.At(354);
-    var typeAssignment = showDamage.At(403);
-    showDamage.Statements.Remove(damageAssignment);
-    showDamage.Statements.Remove(typeAssignment);
-    var finish = showDamage.At(316);
-    var deferredOwner = Local(asset, "CallFunc_BeginDeferredActorSpawnFromClass_ReturnValue", showDamage.ExportIndex);
-    ((EX_Context)((EX_Let)damageAssignment.Expression).Variable).ObjectExpression = deferredOwner;
-    ((EX_Context)((EX_Let)typeAssignment.Expression).Variable).ObjectExpression = deferredOwner;
-    showDamage.InsertBefore(finish, damageAssignment);
-    showDamage.InsertBefore(finish, typeAssignment);
-    showDamage.FinalizeScript();
+    asset.Write(path);
+}
+
+static void PatchBootstrapRunner(string path)
+{
+    var asset = LoadAsset(path);
+    var beginPlayTarget = ReadEntrypoint(asset, "ReceiveBeginPlay");
+    var tickTarget = ReadEntrypoint(asset, "ReceiveTick");
+    var graph = FunctionScript.Parse(asset, "ExecuteUbergraph_BP_Run_ModActor");
+
+    const string canaryPropertyName = "HitMarkers_CanaryShown";
+    graph.Properties.Add(BoolProperty(asset, canaryPropertyName));
+
+    var gameplayStatics = EnsureClass(asset, "/Script/Engine", "GameplayStatics");
+    var systemLibrary = EnsureClass(asset, "/Script/Engine", "KismetSystemLibrary");
+    var mathLibrary = EnsureClass(asset, "/Script/Engine", "KismetMathLibrary");
+    var getPlayerController = EnsureObject(asset, gameplayStatics, "GetPlayerController");
+    var getPlayerCharacter = EnsureObject(asset, gameplayStatics, "GetPlayerCharacter");
+    var isValid = EnsureObject(asset, systemLibrary, "IsValid");
+    var booleanAnd = EnsureObject(asset, mathLibrary, "BooleanAND");
+    var booleanNot = EnsureObject(asset, mathLibrary, "Not_PreBool");
+
+    KismetExpression Controller() => new EX_CallMath
+    {
+        StackNode = getPlayerController,
+        Parameters = new KismetExpression[] { new EX_Self(), new EX_IntConst { Value = 0 } }
+    };
+
+    KismetExpression ControllerValue(string functionName) => new EX_Context
+    {
+        ObjectExpression = Controller(),
+        RValuePointer = EmptyProperty(),
+        ContextExpression = new EX_VirtualFunction
+        {
+            VirtualFunctionName = new FName(asset, functionName),
+            Parameters = Array.Empty<KismetExpression>()
+        }
+    };
+
+    KismetExpression Valid(KismetExpression value) => new EX_CallMath
+    {
+        StackNode = isValid,
+        Parameters = new[] { value }
+    };
+
+    KismetExpression And(KismetExpression left, KismetExpression right) => new EX_CallMath
+    {
+        StackNode = booleanAnd,
+        Parameters = new[] { left, right }
+    };
+
+    void InsertCanaryAfter(ScriptStatement anchor, string prefix)
+    {
+        var component = Local(asset, "CallFunc_AddComponent_ReturnValue", graph.ExportIndex);
+        var notShown = new EX_CallMath
+        {
+            StackNode = booleanNot,
+            Parameters = new KismetExpression[] { Local(asset, canaryPropertyName, graph.ExportIndex) }
+        };
+        var skipShown = new EX_JumpIfNot { BooleanExpression = notShown };
+        var readiness = And(
+            Valid(new EX_CallMath
+            {
+                StackNode = getPlayerCharacter,
+                Parameters = new KismetExpression[] { new EX_Self(), new EX_IntConst { Value = 0 } }
+            }),
+            And(Valid(Controller()), And(Valid(ControllerValue("GetLocalPlayer")),
+                And(Valid(ControllerValue("GetHUD")), Valid(component)))));
+        var skipNotReady = new EX_JumpIfNot { BooleanExpression = readiness };
+
+        var additions = new List<ScriptStatement>
+        {
+            new(null, $"{prefix}_canary_not_shown", skipShown),
+            new(null, $"{prefix}_canary_ready", skipNotReady),
+            new(null, $"{prefix}_readiness_log",
+                PrintLog(asset, "[HitMarkers][Diagnostic] controller, local player, HUD, and Agent ready")),
+            new(null, $"{prefix}_canary_request_log",
+                PrintLog(asset, "[HitMarkers][Diagnostic] startup white canary requested")),
+            new(null, $"{prefix}_canary_display", new EX_Context
+            {
+                ObjectExpression = component,
+                RValuePointer = EmptyProperty(),
+                ContextExpression = new EX_LocalVirtualFunction
+                {
+                    VirtualFunctionName = new FName(asset, "showDamage"),
+                    Parameters = new KismetExpression[]
+                    {
+                        new EX_IntConst { Value = 1 }, new EX_StringConst { Value = "Hit" }
+                    }
+                }
+            }),
+            new(null, $"{prefix}_canary_marked", new EX_LetBool
+            {
+                VariableExpression = Local(asset, canaryPropertyName, graph.ExportIndex),
+                AssignmentExpression = new EX_True()
+            }),
+            new(null, $"{prefix}_after_canary", new EX_Nothing())
+        };
+        graph.Statements.InsertRange(graph.Statements.IndexOf(anchor) + 1, additions);
+        graph.PendingTargets[skipShown] = $"{prefix}_after_canary";
+        graph.PendingTargets[skipNotReady] = $"{prefix}_after_canary";
+    }
+
+    var beginPlayAnchor = graph.At(beginPlayTarget);
+    graph.InsertBefore(beginPlayAnchor, new ScriptStatement(null, "bootstrap_begin_play_log",
+        PrintLog(asset, "[HitMarkers][Diagnostic] runner BeginPlay reached")));
+    InsertCanaryAfter(graph.At(1367), "enemy");
+    InsertCanaryAfter(graph.At(1479), "neutral");
+
+    var map = graph.FinalizeScript();
+    UpdateEntrypoint(asset, "ReceiveBeginPlay", beginPlayTarget, graph.OffsetOf("bootstrap_begin_play_log"));
+    UpdateEntrypoint(asset, "ReceiveTick", tickTarget, map[tickTarget]);
     asset.Write(path);
 }
 
 static void PatchRunner(string path, bool diagnostics)
 {
     var asset = LoadAsset(path);
+    var beginPlayTarget = ReadEntrypoint(asset, "ReceiveBeginPlay");
+    var tickTarget = ReadEntrypoint(asset, "ReceiveTick");
     var graph = FunctionScript.Parse(asset, "ExecuteUbergraph_BP_Run_ModActor");
 
     var stalkerPackage = EnsurePackage(asset, "/Script/Stalker2");
@@ -748,9 +910,22 @@ static void PatchRunner(string path, bool diagnostics)
     graph.PendingTargets[scanTarget] = "old:1531";
 
     var runnerMap = graph.FinalizeScript();
-    UpdateEntrypoint(asset, "ReceiveBeginPlay", 1622, graph.OffsetOf("init_log"));
-    UpdateEntrypoint(asset, "ReceiveTick", 1531, runnerMap[1623]);
+    var terminalReturn = graph.Statements.Last(statement => statement.Expression is EX_Return).OriginalOffset
+        ?? throw new InvalidDataException("Runner terminal return has no original offset.");
+    UpdateEntrypoint(asset, "ReceiveBeginPlay", beginPlayTarget, graph.OffsetOf("init_log"));
+    UpdateEntrypoint(asset, "ReceiveTick", tickTarget, runnerMap[terminalReturn]);
     asset.Write(path);
+}
+
+static int ReadEntrypoint(UAsset asset, string functionName)
+{
+    var function = FunctionScript.Parse(asset, functionName);
+    var targets = Flatten(function, asset).OfType<EX_IntConst>().Select(value => value.Value).Distinct().ToArray();
+    if (targets.Length != 1)
+    {
+        throw new InvalidDataException($"Expected one {functionName} ubergraph entrypoint, found {targets.Length}.");
+    }
+    return targets[0];
 }
 
 static void UpdateEntrypoint(UAsset asset, string functionName, int oldTarget, uint newTarget)
@@ -941,6 +1116,78 @@ static void VerifyPatchedAssets(string root)
         "marker opacity initialization");
 }
 
+static void VerifyBootstrapAssets(string root)
+{
+    var modRoot = Path.Combine(root, "Stalker2", "Content", "Mods", "ShowDMG");
+    var runnerAsset = LoadAsset(Path.Combine(modRoot, "BP_Run_ModActor.uasset"));
+    var runner = FunctionScript.Parse(runnerAsset, "ExecuteUbergraph_BP_Run_ModActor");
+    var runnerNodes = Flatten(runner, runnerAsset);
+    Require(runner.Properties.OfType<FBoolProperty>().Count(item =>
+        item.Name.Value.Value == "HitMarkers_CanaryShown") == 1, "persistent one-shot canary guard");
+    Require(runnerNodes.OfType<EX_StringConst>().Any(item =>
+        item.Value == "[HitMarkers][Diagnostic] runner BeginPlay reached"), "derived BeginPlay diagnostic");
+    Require(runnerNodes.OfType<EX_StringConst>().Any(item =>
+        item.Value == "[HitMarkers][Diagnostic] controller, local player, HUD, and Agent ready"),
+        "runtime readiness diagnostic");
+    Require(runnerNodes.OfType<EX_LocalVirtualFunction>().Count(item =>
+        item.VirtualFunctionName.Value.Value == "showDamage") == 2, "one-shot canary branch coverage");
+    Require(!runnerNodes.OfType<EX_BindDelegate>().Any(), "bootstrap mode excludes delegate binding");
+    Require(!runnerNodes.OfType<EX_AddMulticastDelegate>().Any(), "bootstrap mode excludes multicast registration");
+    Require(!runnerNodes.OfType<EX_FinalFunction>().Any(item =>
+        StackName(item.StackNode, runnerAsset) == "SetBroadcastHitPending"),
+        "bootstrap mode excludes hit broadcast changes");
+    var beginPlayTarget = ReadEntrypoint(runnerAsset, "ReceiveBeginPlay");
+    var tickTarget = ReadEntrypoint(runnerAsset, "ReceiveTick");
+    Require(runner.Statements.Any(item => runner.OffsetOf(item.Tag) == beginPlayTarget &&
+        FlattenExpression(item.Expression, runnerAsset).OfType<EX_StringConst>().Any(value =>
+            value.Value == "[HitMarkers][Diagnostic] runner BeginPlay reached")),
+        "ReceiveBeginPlay targets bootstrap diagnostic");
+    Require(runner.Statements.Any(item => runner.OffsetOf(item.Tag) == tickTarget),
+        "ReceiveTick targets valid remapped bytecode");
+
+    var spawnerAsset = LoadAsset(Path.Combine(modRoot, "bpac_dmgWidgetSpawner.uasset"));
+    Require(spawnerAsset.Exports.OfType<RawExport>().Any(item => item.ObjectName.Value.Value == "setAgentOwner"),
+        "original spawner handler remains present");
+    Require(!spawnerAsset.Exports.OfType<RawExport>().Any(item => item.ObjectName.Value.Value == "OnBulletProjectileHit"),
+        "bootstrap mode excludes damage callback replacement");
+    var showDamage = FunctionScript.Parse(spawnerAsset, "showDamage");
+    var finishIndex = showDamage.Statements.FindIndex(statement =>
+        FlattenExpression(statement.Expression, spawnerAsset).OfType<EX_CallMath>()
+            .Any(item => StackName(item.StackNode, spawnerAsset) == "FinishSpawningActor"));
+    var initializationIndices = showDamage.Statements
+        .Select((statement, index) => (statement.Expression, index))
+        .Where(item => item.Expression is EX_Let let && let.Value.New is not null &&
+            let.Value.New.Path.Any(name => name.Value.Value is "dmg" or "rel"))
+        .Select(item => item.index).ToArray();
+    Require(finishIndex >= 0 && initializationIndices.Length == 2 &&
+        initializationIndices.All(index => index < finishIndex),
+        "bootstrap pre-FinishSpawning marker initialization");
+
+    var holderAsset = LoadAsset(Path.Combine(modRoot, "bp_dmgActorHolder.uasset"));
+    var holder = FunctionScript.Parse(holderAsset, "ExecuteUbergraph_bp_dmgActorHolder");
+    var holderNodes = Flatten(holder, holderAsset);
+    Require(holderNodes.OfType<EX_VirtualFunction>().Any(item =>
+        item.VirtualFunctionName.Value.Value == "AddToPlayerScreen"), "bootstrap viewport insertion");
+    foreach (var message in new[]
+    {
+        "[HitMarkers][Diagnostic] widget created; viewport inserted; visible; fade started",
+        "[HitMarkers][Diagnostic] fade completed; widget removed"
+    })
+    {
+        Require(holderNodes.OfType<EX_StringConst>().Any(item => item.Value == message), message);
+    }
+
+    var areaAsset = LoadAsset(Path.Combine(modRoot, "wbp_ShowDMGArea.uasset"));
+    var area = FunctionScript.Parse(areaAsset, "showDamage");
+    var areaNodes = Flatten(area, areaAsset);
+    Require(areaNodes.OfType<EX_CallMath>().Any(item => StackName(item.StackNode, areaAsset) == "GetPlayerController"),
+        "bootstrap owning-player marker creation");
+    Require(areaNodes.OfType<EX_VirtualFunction>().Any(item => item.VirtualFunctionName.Value.Value == "SetVisibility"),
+        "bootstrap marker visibility");
+    Require(areaNodes.OfType<EX_VirtualFunction>().Any(item => item.VirtualFunctionName.Value.Value == "SetRenderOpacity"),
+        "bootstrap marker opacity");
+}
+
 static List<KismetExpression> Flatten(FunctionScript function, UAsset asset)
 {
     var result = new List<KismetExpression>();
@@ -1094,6 +1341,28 @@ static FDelegateProperty DelegateProperty(
         RepNotifyFunc = new FName(asset, "None"),
         BlueprintReplicationCondition = ELifetimeCondition.COND_None,
         SignatureFunction = signatureFunction
+    };
+}
+
+static FBoolProperty BoolProperty(UAsset asset, string name)
+{
+    return new FBoolProperty
+    {
+        SerializedType = new FName(asset, "BoolProperty"),
+        Name = new FName(asset, name),
+        Flags = EObjectFlags.RF_Public,
+        ArrayDim = EArrayDim.TArray,
+        ElementSize = 1,
+        PropertyFlags = EPropertyFlags.CPF_None,
+        RepIndex = 0,
+        RepNotifyFunc = new FName(asset, "None"),
+        BlueprintReplicationCondition = ELifetimeCondition.COND_None,
+        FieldSize = 1,
+        ByteOffset = 0,
+        ByteMask = 1,
+        FieldMask = byte.MaxValue,
+        NativeBool = true,
+        Value = true
     };
 }
 
@@ -1391,5 +1660,251 @@ static class ExpressionWalker
     {
         uint offset = 0;
         expression.Visit(asset, ref offset, (node, _) => visitor(node));
+    }
+}
+
+static class IoStoreToc
+{
+    private const int HeaderSize = 0x90;
+    private const int ChunkIdSize = 12;
+    private const int OffsetAndLengthSize = 10;
+    private const int EntryMetaSize = 33;
+    private const byte PerfectHashWithOverflowVersion = 5;
+    private const byte EncryptedFlag = 0x02;
+    private const byte SignedFlag = 0x04;
+    private const byte IndexedFlag = 0x08;
+    private static readonly byte[] Magic = "-==--==--==--==-"u8.ToArray();
+
+    public static void RestoreReferenceIndex(string referencePath, string generatedPath, string outputPath)
+    {
+        var reference = ParsedToc.Read(referencePath);
+        var generated = ParsedToc.Read(generatedPath);
+        ValidateCompatible(reference, generated);
+
+        var generatedByChunk = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < generated.EntryCount; i++)
+        {
+            var id = generated.ChunkId(i);
+            if (!generatedByChunk.TryAdd(id, i))
+            {
+                throw new InvalidDataException($"Generated container has duplicate chunk ID {id}.");
+            }
+        }
+
+        var header = generated.Header.ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(48, 4), checked((uint)reference.DirectoryIndex.Length));
+        reference.Header.AsSpan(56, 8).CopyTo(header.AsSpan(56, 8));
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(84, 4), checked((uint)reference.PerfectHashSeedCount));
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(96, 4), checked((uint)reference.OverflowCount));
+
+        using var output = new MemoryStream();
+        output.Write(header);
+        output.Write(reference.ChunkIds);
+        for (var i = 0; i < reference.EntryCount; i++)
+        {
+            var id = reference.ChunkId(i);
+            if (!generatedByChunk.TryGetValue(id, out var generatedIndex))
+            {
+                throw new InvalidDataException($"Generated container is missing reference chunk ID {id}.");
+            }
+
+            output.Write(generated.OffsetAndLengths.AsSpan(generatedIndex * OffsetAndLengthSize, OffsetAndLengthSize));
+        }
+
+        output.Write(reference.PerfectHashSeeds);
+        output.Write(reference.OverflowIndices);
+        output.Write(generated.CompressionBlocks);
+        output.Write(generated.CompressionMethods);
+        output.Write(reference.DirectoryIndex);
+        for (var i = 0; i < reference.EntryCount; i++)
+        {
+            var generatedIndex = generatedByChunk[reference.ChunkId(i)];
+            output.Write(generated.EntryMetas.AsSpan(generatedIndex * EntryMetaSize, EntryMetaSize));
+        }
+
+        var fullOutputPath = Path.GetFullPath(outputPath);
+        if (fullOutputPath.Equals(Path.GetFullPath(referencePath), StringComparison.OrdinalIgnoreCase) ||
+            fullOutputPath.Equals(Path.GetFullPath(generatedPath), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Container index restoration requires a distinct output path.");
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(fullOutputPath)!);
+        File.WriteAllBytes(fullOutputPath, output.ToArray());
+        VerifyReferenceIndex(referencePath, fullOutputPath);
+    }
+
+    public static void VerifyReferenceIndex(string referencePath, string candidatePath)
+    {
+        var reference = ParsedToc.Read(referencePath);
+        var candidate = ParsedToc.Read(candidatePath);
+        ValidateCompatible(reference, candidate);
+
+        Require(candidate.PerfectHashSeedCount > 0, "Candidate container has no perfect-hash seeds.");
+        Require(candidate.ChunkIds.AsSpan().SequenceEqual(reference.ChunkIds),
+            "Candidate chunk order differs from the working reference.");
+        Require(candidate.PerfectHashSeeds.AsSpan().SequenceEqual(reference.PerfectHashSeeds),
+            "Candidate perfect-hash seeds differ from the working reference.");
+        Require(candidate.OverflowIndices.AsSpan().SequenceEqual(reference.OverflowIndices),
+            "Candidate perfect-hash overflow table differs from the working reference.");
+        Require(candidate.DirectoryIndex.AsSpan().SequenceEqual(reference.DirectoryIndex),
+            "Candidate directory index or mount point differs from the working reference.");
+        Require((candidate.ContainerFlags & IndexedFlag) != 0, "Candidate container is not indexed.");
+        Require(candidate.CompressionBlockCount > 0, "Candidate container has no compression blocks.");
+        Require(candidate.CompressionBlockEntrySize == 12, "Candidate compression block entry size is not 12 bytes.");
+    }
+
+    private static void ValidateCompatible(ParsedToc reference, ParsedToc candidate)
+    {
+        Require(reference.Version == PerfectHashWithOverflowVersion,
+            $"Reference TOC version {reference.Version} is not PerfectHashWithOverflow ({PerfectHashWithOverflowVersion}).");
+        Require(candidate.Version == reference.Version, "Candidate TOC version differs from the working reference.");
+        Require(reference.EntryCount == candidate.EntryCount, "Candidate chunk count differs from the working reference.");
+        Require(reference.ContainerId == candidate.ContainerId, "Candidate container ID differs from the working reference.");
+        Require(reference.PerfectHashSeedCount > 0, "Working reference has no perfect-hash seeds.");
+        Require((reference.ContainerFlags & (EncryptedFlag | SignedFlag)) == 0,
+            "Encrypted or signed reference containers are not supported.");
+        Require((candidate.ContainerFlags & (EncryptedFlag | SignedFlag)) == 0,
+            "Encrypted or signed candidate containers are not supported.");
+
+        var referenceIds = new HashSet<string>(StringComparer.Ordinal);
+        var candidateIds = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < reference.EntryCount; i++) referenceIds.Add(reference.ChunkId(i));
+        for (var i = 0; i < candidate.EntryCount; i++) candidateIds.Add(candidate.ChunkId(i));
+        Require(referenceIds.SetEquals(candidateIds), "Candidate chunk IDs differ from the working reference.");
+    }
+
+    private static void Require(bool condition, string message)
+    {
+        if (!condition) throw new InvalidDataException(message);
+    }
+
+    private sealed class ParsedToc
+    {
+        public required byte[] Header { get; init; }
+        public required byte Version { get; init; }
+        public required int EntryCount { get; init; }
+        public required int CompressionBlockCount { get; init; }
+        public required int CompressionBlockEntrySize { get; init; }
+        public required int CompressionBlockSize { get; init; }
+        public required int PerfectHashSeedCount { get; init; }
+        public required int OverflowCount { get; init; }
+        public required ulong ContainerId { get; init; }
+        public required byte ContainerFlags { get; init; }
+        public required byte[] ChunkIds { get; init; }
+        public required byte[] OffsetAndLengths { get; init; }
+        public required byte[] PerfectHashSeeds { get; init; }
+        public required byte[] OverflowIndices { get; init; }
+        public required byte[] CompressionBlocks { get; init; }
+        public required byte[] CompressionMethods { get; init; }
+        public required byte[] DirectoryIndex { get; init; }
+        public required byte[] EntryMetas { get; init; }
+
+        public string ChunkId(int index)
+        {
+            if ((uint)index >= (uint)EntryCount) throw new ArgumentOutOfRangeException(nameof(index));
+            return Convert.ToHexString(ChunkIds.AsSpan(index * ChunkIdSize, ChunkIdSize));
+        }
+
+        public static ParsedToc Read(string path)
+        {
+            if (!File.Exists(path)) throw new FileNotFoundException("IoStore TOC was not found.", path);
+            var bytes = File.ReadAllBytes(path);
+            if (bytes.Length < HeaderSize) throw new InvalidDataException($"IoStore TOC is truncated: {path}");
+            if (!bytes.AsSpan(0, Magic.Length).SequenceEqual(Magic))
+            {
+                throw new InvalidDataException($"IoStore TOC has an invalid magic value: {path}");
+            }
+
+            var headerSize = ReadInt32(bytes, 20, "header size");
+            Require(headerSize == HeaderSize, $"Unsupported IoStore TOC header size {headerSize} in {path}.");
+
+            var version = bytes[16];
+            var entryCount = ReadInt32(bytes, 24, "entry count");
+            var compressionBlockCount = ReadInt32(bytes, 28, "compression block count");
+            var compressionBlockEntrySize = ReadInt32(bytes, 32, "compression block entry size");
+            var compressionMethodCount = ReadInt32(bytes, 36, "compression method count");
+            var compressionMethodNameLength = ReadInt32(bytes, 40, "compression method name length");
+            var compressionBlockSize = ReadInt32(bytes, 44, "compression block size");
+            var directoryIndexSize = ReadInt32(bytes, 48, "directory index size");
+            var perfectHashSeedCount = version >= PerfectHashWithOverflowVersion
+                ? ReadInt32(bytes, 84, "perfect-hash seed count")
+                : 0;
+            var overflowCount = version >= PerfectHashWithOverflowVersion
+                ? ReadInt32(bytes, 96, "perfect-hash overflow count")
+                : 0;
+            var containerId = BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(56, 8));
+            var containerFlags = bytes[80];
+
+            var cursor = HeaderSize;
+            byte[] Take(int length, string description)
+            {
+                if (length < 0 || cursor > bytes.Length - length)
+                {
+                    throw new InvalidDataException($"IoStore TOC {description} is truncated in {path}.");
+                }
+
+                var result = bytes.AsSpan(cursor, length).ToArray();
+                cursor += length;
+                return result;
+            }
+
+            var chunkIds = Take(CheckedLength(entryCount, ChunkIdSize, "chunk IDs"), "chunk IDs");
+            var offsetAndLengths = Take(CheckedLength(entryCount, OffsetAndLengthSize, "offset table"), "offset table");
+            var perfectHashSeeds = Take(CheckedLength(perfectHashSeedCount, sizeof(int), "perfect-hash seeds"), "perfect-hash seeds");
+            var overflowIndices = Take(CheckedLength(overflowCount, sizeof(int), "perfect-hash overflow table"), "perfect-hash overflow table");
+            var compressionBlocks = Take(CheckedLength(compressionBlockCount, compressionBlockEntrySize, "compression blocks"), "compression blocks");
+            var compressionMethods = Take(CheckedLength(compressionMethodCount, compressionMethodNameLength, "compression methods"), "compression methods");
+            if ((containerFlags & SignedFlag) != 0)
+            {
+                throw new InvalidDataException($"Signed IoStore TOCs are not supported: {path}");
+            }
+
+            var directoryIndex = Take(directoryIndexSize, "directory index");
+            var entryMetas = Take(CheckedLength(entryCount, EntryMetaSize, "entry metadata"), "entry metadata");
+            Require(cursor == bytes.Length, $"IoStore TOC contains unsupported trailing metadata in {path}.");
+
+            return new ParsedToc
+            {
+                Header = bytes.AsSpan(0, HeaderSize).ToArray(),
+                Version = version,
+                EntryCount = entryCount,
+                CompressionBlockCount = compressionBlockCount,
+                CompressionBlockEntrySize = compressionBlockEntrySize,
+                CompressionBlockSize = compressionBlockSize,
+                PerfectHashSeedCount = perfectHashSeedCount,
+                OverflowCount = overflowCount,
+                ContainerId = containerId,
+                ContainerFlags = containerFlags,
+                ChunkIds = chunkIds,
+                OffsetAndLengths = offsetAndLengths,
+                PerfectHashSeeds = perfectHashSeeds,
+                OverflowIndices = overflowIndices,
+                CompressionBlocks = compressionBlocks,
+                CompressionMethods = compressionMethods,
+                DirectoryIndex = directoryIndex,
+                EntryMetas = entryMetas
+            };
+        }
+
+        private static int ReadInt32(byte[] bytes, int offset, string description)
+        {
+            var value = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset, sizeof(uint)));
+            if (value > int.MaxValue) throw new InvalidDataException($"IoStore TOC {description} is too large.");
+            return (int)value;
+        }
+
+        private static int CheckedLength(int count, int itemSize, string description)
+        {
+            if (count < 0 || itemSize < 0) throw new InvalidDataException($"IoStore TOC {description} has a negative size.");
+            try
+            {
+                return checked(count * itemSize);
+            }
+            catch (OverflowException exception)
+            {
+                throw new InvalidDataException($"IoStore TOC {description} is too large.", exception);
+            }
+        }
     }
 }
