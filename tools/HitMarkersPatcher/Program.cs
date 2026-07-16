@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Text;
 using System.Text.Json;
 using UAssetAPI;
 using UAssetAPI.CustomVersions;
@@ -75,6 +76,7 @@ if (args.Length == 3 && args[0] == "--direct-release")
     CopyDirectory(directSourceRoot, directOutputRoot);
     var directModRoot = Path.Combine(directOutputRoot, "Stalker2", "Content", "Mods", "ShowDMG");
     PatchDirectReleaseWidget(Path.Combine(directModRoot, "wbp_ShowDMG.uasset"));
+    PatchDirectReleaseArea(Path.Combine(directModRoot, "wbp_ShowDMGArea.uasset"));
     PatchDirectReleaseSpawner(Path.Combine(directModRoot, "bpac_dmgWidgetSpawner.uasset"));
     VerifyDirectReleaseAssets(directSourceRoot, directOutputRoot);
     Console.WriteLine($"Patched length-preserving direct release assets in {directOutputRoot}");
@@ -339,6 +341,46 @@ static void PatchDirectReleaseWidget(string path)
     asset.Write(path);
 }
 
+static void PatchDirectReleaseArea(string path)
+{
+    var asset = LoadAsset(path);
+    var oldName = new FString("BlueprintType", Encoding.UTF8);
+    var newName = new FString("AddToViewport", Encoding.UTF8);
+    if (oldName.Value.Length != newName.Value.Length)
+    {
+        throw new InvalidDataException("Direct viewport name replacement must preserve its serialized length.");
+    }
+    asset.SetNameReference(asset.SearchNameReference(oldName), newName);
+
+    var function = FunctionScript.Parse(asset, "showDamage");
+    var functionExport = asset.Exports.OfType<RawExport>()
+        .Single(export => export.ObjectName.Value.Value == "showDamage");
+    var originalFunctionLength = functionExport.Data.Length;
+
+    foreach (var offset in new[] { 53, 99 })
+    {
+        Visit(function.At(offset).Expression, asset, expression =>
+        {
+            if (expression is EX_DoubleConst value) value.Value = 0d;
+        });
+    }
+
+    function.At(232).Expression = new EX_Context
+    {
+        ObjectExpression = Local(asset, "CallFunc_Create_ReturnValue", function.ExportIndex),
+        RValuePointer = EmptyProperty(),
+        ContextExpression = new EX_VirtualFunction
+        {
+            VirtualFunctionName = new FName(asset, "AddToViewport"),
+            Parameters = new KismetExpression[] { new EX_IntConst { Value = 10000 } }
+        }
+    };
+
+    FinalizeWithStoragePadding(function, functionExport, function.At(337), originalFunctionLength,
+        "direct_release_area_padding");
+    asset.Write(path);
+}
+
 static void PatchDirectReleaseSpawner(string path)
 {
     var asset = LoadAsset(path);
@@ -449,6 +491,7 @@ static void VerifyDirectReleaseAssets(string sourceRoot, string candidateRoot)
     {
         @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMG.uasset|ShowDamage",
         @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMG.uasset|TXT_DMG",
+        @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMGArea.uasset|showDamage",
         @"Stalker2\Content\Mods\ShowDMG\bpac_dmgWidgetSpawner.uasset|ExecuteUbergraph_bpac_dmgWidgetSpawner",
         @"Stalker2\Content\Mods\ShowDMG\bpac_dmgWidgetSpawner.uasset|ReceiveTick"
     };
@@ -483,6 +526,29 @@ static void VerifyDirectReleaseAssets(string sourceRoot, string candidateRoot)
         .Single(export => export.ObjectName.Value.Value == "TXT_DMG");
     Require(textBlock.Data.AsSpan().IndexOf(new byte[] { 0x20, 0x58, 0x20, 0x00 }) >= 0,
         "direct release marker text exists");
+
+    var namePatches = CollectLegacyNamePatches(sourceRoot, candidateRoot);
+    Require(namePatches.Count == 1 &&
+        namePatches[0].RelativeAssetPath.Equals(
+            @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMGArea.uasset", StringComparison.OrdinalIgnoreCase) &&
+        namePatches[0].SourceName == "BlueprintType" && namePatches[0].PatchedName == "AddToViewport",
+        "direct release contains only the fixed-length viewport name replacement");
+
+    var area = LoadAsset(Path.Combine(modRoot, "wbp_ShowDMGArea.uasset"));
+    var showDamage = FunctionScript.Parse(area, "showDamage");
+    var areaNodes = Flatten(showDamage, area);
+    var viewportCalls = areaNodes.OfType<EX_VirtualFunction>()
+        .Where(call => call.VirtualFunctionName.Value.Value == "AddToViewport").ToArray();
+    Require(viewportCalls.Length == 1 && viewportCalls[0].Parameters is
+        [EX_IntConst { Value: 10000 }], "marker child is inserted at viewport Z-order 10000");
+    Require(!areaNodes.OfType<EX_FinalFunction>()
+        .Any(call => StackName(call.StackNode, area) == "AddChild"),
+        "marker child is not reattached to the enemy's world-space overlay");
+    Require(areaNodes.OfType<EX_DoubleConst>().All(value => Math.Abs(value.Value) < 0.0001d),
+        "marker viewport translation is fixed at the crosshair center");
+    Require(areaNodes.OfType<EX_LocalVirtualFunction>()
+        .Any(call => call.VirtualFunctionName.Value.Value == "ShowDamage"),
+        "centered marker retains its color and fade animation call");
 
     var spawner = LoadAsset(Path.Combine(modRoot, "bpac_dmgWidgetSpawner.uasset"));
     var tickTarget = ReadEntrypoint(spawner, "ReceiveTick");
@@ -615,8 +681,17 @@ static void RequireSameAssetStructure(UAsset source, UAsset candidate, string re
     Same(source.GetEngineVersion() == candidate.GetEngineVersion(), "engine version");
     Same(source.IsUnversioned == candidate.IsUnversioned, "unversioned flag");
     Same(source.UseSeparateBulkDataFiles == candidate.UseSeparateBulkDataFiles, "bulk-data flag");
-    Same(source.GetNameMapIndexList().Select(name => name.Value)
-        .SequenceEqual(candidate.GetNameMapIndexList().Select(name => name.Value)), "name map");
+    var sourceNames = source.GetNameMapIndexList().Select(name => name.Value).ToArray();
+    var candidateNames = candidate.GetNameMapIndexList().Select(name => name.Value).ToArray();
+    var nameChanges = sourceNames.Zip(candidateNames)
+        .Select((pair, index) => (index, Source: pair.First, Candidate: pair.Second))
+        .Where(change => change.Source != change.Candidate)
+        .ToArray();
+    var allowedViewportName = relativePath.Equals(
+            @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMGArea.uasset", StringComparison.OrdinalIgnoreCase) &&
+        sourceNames.Length == candidateNames.Length && nameChanges is
+        [{ Source: "BlueprintType", Candidate: "AddToViewport" }];
+    Same(sourceNames.SequenceEqual(candidateNames) || allowedViewportName, "name map");
     Same(source.Imports.Count == candidate.Imports.Count, "import count");
     for (var index = 0; index < source.Imports.Count; index++)
     {
@@ -643,6 +718,46 @@ static void RequireSameAssetStructure(UAsset source, UAsset candidate, string re
             left.SerialSize == right.SerialSize,
             $"export {index} metadata");
     }
+}
+
+static List<LegacyNamePatch> CollectLegacyNamePatches(string sourceRoot, string candidateRoot)
+{
+    var patches = new List<LegacyNamePatch>();
+    foreach (var sourcePath in Directory.EnumerateFiles(sourceRoot, "*.uasset", SearchOption.AllDirectories))
+    {
+        var relativePath = Path.GetRelativePath(sourceRoot, sourcePath);
+        var candidatePath = Path.Combine(candidateRoot, relativePath);
+        if (!File.Exists(candidatePath))
+        {
+            throw new FileNotFoundException("Direct HUD candidate asset is missing.", candidatePath);
+        }
+
+        var sourceNames = LoadAsset(sourcePath).GetNameMapIndexList().Select(name => name.Value).ToArray();
+        var candidateNames = LoadAsset(candidatePath).GetNameMapIndexList().Select(name => name.Value).ToArray();
+        if (sourceNames.Length != candidateNames.Length)
+        {
+            throw new InvalidDataException($"Direct HUD patch changed {relativePath} name-map length.");
+        }
+
+        for (var index = 0; index < sourceNames.Length; index++)
+        {
+            if (sourceNames[index] == candidateNames[index]) continue;
+            if (!relativePath.Equals(
+                    @"Stalker2\Content\Mods\ShowDMG\wbp_ShowDMGArea.uasset",
+                    StringComparison.OrdinalIgnoreCase) || index != 0 ||
+                sourceNames[index] != "BlueprintType" || candidateNames[index] != "AddToViewport")
+            {
+                throw new InvalidDataException(
+                    $"Direct HUD patch made an unsupported name-map change in {relativePath} at index {index}.");
+            }
+
+            patches.Add(new LegacyNamePatch(relativePath, index, sourceNames[index], candidateNames[index],
+                new byte[] { 0x04, 0xDD, 0x7C, 0x79, 0x1B, 0xFC, 0x6A, 0x13 },
+                new byte[] { 0x0A, 0xA9, 0x82, 0x15, 0x5B, 0xE6, 0x89, 0x49 }));
+        }
+    }
+
+    return patches;
 }
 
 static bool IsLinearColor(KismetExpression expression, UAsset asset, params float[] expected)
@@ -783,9 +898,10 @@ static Dictionary<string, byte[]> BuildTransplantedChunks(
     string patchedRoot)
 {
     var exportPatches = CollectLegacyExportPatches(sourceRoot, patchedRoot);
-    if (exportPatches.Count == 0)
+    var namePatches = CollectLegacyNamePatches(sourceRoot, patchedRoot);
+    if (exportPatches.Count == 0 && namePatches.Count == 0)
     {
-        throw new InvalidDataException("No changed legacy exports were supplied for direct Zen transplant.");
+        throw new InvalidDataException("No changed legacy exports or names were supplied for direct Zen transplant.");
     }
 
     var manifestPath = Path.Combine(referenceRawRoot, "manifest.json");
@@ -839,6 +955,55 @@ static Dictionary<string, byte[]> BuildTransplantedChunks(
         patch.PatchedData.CopyTo(chunk, offset);
         occupiedRanges[chunkId].Add((offset, end));
         Console.WriteLine($"Mapped {patch.RelativeAssetPath}:{patch.ExportName} to chunk {chunkId} at 0x{offset:X}.");
+    }
+
+    foreach (var patch in namePatches)
+    {
+        var cookedPath = NormalizeCookedPath(patch.RelativeAssetPath);
+        if (!chunkPaths.TryGetValue(cookedPath, out var chunkId))
+        {
+            throw new InvalidDataException($"Raw manifest has no package chunk for {patch.RelativeAssetPath}.");
+        }
+        if (!chunks.TryGetValue(chunkId, out var chunk))
+        {
+            var chunkPath = Path.Combine(referenceRawRoot, "chunks", chunkId);
+            if (!File.Exists(chunkPath)) throw new FileNotFoundException("Reference raw chunk is missing.", chunkPath);
+            chunk = File.ReadAllBytes(chunkPath);
+            chunks.Add(chunkId, chunk);
+            occupiedRanges.Add(chunkId, new List<(int Start, int End)>());
+        }
+
+        var sourceBytes = Encoding.UTF8.GetBytes(patch.SourceName);
+        var patchedBytes = Encoding.UTF8.GetBytes(patch.PatchedName);
+        if (sourceBytes.Length != patchedBytes.Length)
+        {
+            throw new InvalidDataException("Direct Zen local-name replacement is not length-preserving.");
+        }
+        var nameOffset = FindUniqueSequence(chunk, sourceBytes,
+            $"local name {patch.RelativeAssetPath}:{patch.SourceName}");
+        const int zenNameHashesOffset = 60;
+        var hashOffset = checked(zenNameHashesOffset + patch.NameIndex * 8);
+        if (!chunk.AsSpan(hashOffset, patch.SourceHash.Length).SequenceEqual(patch.SourceHash))
+        {
+            throw new InvalidDataException(
+                $"Original Zen name hash differs for {patch.RelativeAssetPath}:{patch.SourceName}.");
+        }
+        var ranges = new[]
+        {
+            (Start: nameOffset, End: nameOffset + sourceBytes.Length),
+            (Start: hashOffset, End: hashOffset + patch.SourceHash.Length)
+        };
+        if (ranges.Any(candidate => occupiedRanges[chunkId]
+            .Any(existing => candidate.Start < existing.End && candidate.End > existing.Start)))
+        {
+            throw new InvalidDataException($"Direct Zen name patch overlaps another patch in chunk {chunkId}.");
+        }
+
+        patchedBytes.CopyTo(chunk, nameOffset);
+        patch.PatchedHash.CopyTo(chunk, hashOffset);
+        occupiedRanges[chunkId].AddRange(ranges);
+        Console.WriteLine(
+            $"Mapped {patch.RelativeAssetPath}:{patch.SourceName}->{patch.PatchedName} to chunk {chunkId}.");
     }
 
     return chunks;
@@ -2159,6 +2324,14 @@ sealed record LegacyExportPatch(
     string ExportName,
     byte[] SourceData,
     byte[] PatchedData);
+
+sealed record LegacyNamePatch(
+    string RelativeAssetPath,
+    int NameIndex,
+    string SourceName,
+    string PatchedName,
+    byte[] SourceHash,
+    byte[] PatchedHash);
 
 sealed class ScriptStatement
 {
